@@ -142,7 +142,7 @@ PAGE = """<!DOCTYPE html>
 
     <div class="divider"></div>
 
-    <p class="tagline">Agentic Solutions for the Built Environment</p>
+    <p class="tagline">We Engineer Zeros and Ones for the Built Environment, So You Don't Have To</p>
 
     <p class="services-label">Services</p>
 
