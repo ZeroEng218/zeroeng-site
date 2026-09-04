@@ -157,11 +157,6 @@ PAGE = """<!DOCTYPE html>
             <span class="tile-name">Autodesk Dynamo</span>
             <p class="tile-desc">Parametric scripting and automation inside Revit and Civil 3D — streamlining repetitive workflows and driving data-informed design.</p>
         </div>
-        <div class="tile">
-            <span class="tile-label">For AI Agents</span>
-            <span class="tile-name">Geo Lookup Tool</span>
-            <p class="tile-desc">A live public MCP tool: latitude/longitude &rarr; U.S. state. Get a free key at <a href="https://mcp.zeroeng.io/register">mcp.zeroeng.io/register</a>, then connect to <a href="https://mcp.zeroeng.io/mcp">mcp.zeroeng.io/mcp</a>. Details: <a href="/llms.txt">/llms.txt</a>.</p>
-        </div>
     </div>
 
     <p class="contact">contact &mdash; <a href="mailto:admin@zeroeng.io">admin@zeroeng.io</a></p>
