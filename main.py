@@ -187,7 +187,7 @@ PAGE = """<!DOCTYPE html>
         <div class="tile">
             <span class="tile-label">Offering</span>
             <span class="tile-name">MCP Server</span>
-            <p class="tile-desc">Custom Model Context Protocol servers that give your AI agents secure, structured access to tools, data, and workflows. Live tools at <a href="/mcp">/mcp</a> (streamable HTTP, JSON-RPC 2.0): <code>state_capital_lookup</code>, <code>soil_lookup</code> — USDA SSURGO soil types &amp; GeoJSON boundaries by lat/lon, and <code>fema_flood_lookup</code> — FEMA NFHL flood zones &amp; GeoJSON boundaries by lat/lon.</p>
+            <p class="tile-desc">Custom Model Context Protocol servers that give your AI agents secure, structured access to tools, data, and workflows. Live tools at <a href="/mcp">/mcp</a> (streamable HTTP, JSON-RPC 2.0): <code>state_capital_lookup</code>; <code>soil_lookup</code> — USDA SSURGO soil types &amp; GeoJSON boundaries by lat/lon; <code>fema_flood_lookup</code> — FEMA NFHL flood zones &amp; GeoJSON boundaries by lat/lon; and <code>wetland_lookup</code> — USFWS NWI wetland classifications &amp; GeoJSON boundaries by lat/lon.</p>
         </div>
         <div class="tile">
             <span class="tile-label">Offering</span>
@@ -250,6 +250,21 @@ no relationship with us required.
   lat/lon and draw the returned flood-zone polygons directly in a drawing.
 - Coverage is mapped U.S. communities; unmapped, offshore, or international
   points return no flood zones.
+
+### wetland_lookup
+
+- Args: lat (number), lon (number). Coordinates are WGS84 decimal degrees.
+- Returns: USFWS National Wetlands Inventory (NWI) wetland feature(s) at that
+  point -- Cowardin attribute code (e.g. PEM1C, PFO1A), wetland type, system
+  (Palustrine/Estuarine/Riverine/Lacustrine/Marine), class (Emergent,
+  Forested, Scrub-Shrub, ...), water regime, special modifiers, acreage, a
+  plain-language description, and a Clean Water Act Section 404 / Section 10
+  regulatory note -- plus GeoJSON polygon boundaries for each wetland, backed
+  by the USFWS NWI ArcGIS service (authoritative wetland-mapping data).
+- Intended for CAD/GIS agents: e.g. Civil 3D / Dynamo can call this with a
+  lat/lon and draw the returned wetland polygons directly in a drawing.
+- Coverage is mapped U.S. areas; unmapped, offshore, or international points
+  return no wetlands (field verification still recommended).
 
 ## Services
 
@@ -348,6 +363,29 @@ TOOLS = [
             "Look up FEMA National Flood Hazard Layer (NFHL) flood zone "
             "classifications and boundaries for a given latitude and longitude. "
             "Returns flood zone designation, risk level, and GeoJSON polygon "
+            "boundaries."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lat": {
+                    "type": "number",
+                    "description": "Latitude (WGS84, decimal degrees)",
+                },
+                "lon": {
+                    "type": "number",
+                    "description": "Longitude (WGS84, decimal degrees)",
+                },
+            },
+            "required": ["lat", "lon"],
+        },
+    },
+    {
+        "name": "wetland_lookup",
+        "description": (
+            "Look up USFWS National Wetlands Inventory (NWI) wetland "
+            "classifications and boundaries for a given latitude and longitude. "
+            "Returns wetland type, classification codes, and GeoJSON polygon "
             "boundaries."
         ),
         "inputSchema": {
@@ -917,6 +955,381 @@ def fema_flood_lookup(lat, lon) -> dict:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# USFWS National Wetlands Inventory (NWI) -- public ArcGIS REST service,
+# no API key required. Layer 0 is the Wetlands polygon layer. Coordinates
+# (Cowardin classification) are parsed from the ATTRIBUTE code.
+# ─────────────────────────────────────────────────────────────────────────
+NWI_WETLANDS_URL = (
+    "https://fwspublicservices.wim.usgs.gov/wetlandsmapservice/rest/services/"
+    "Wetlands/MapServer/0/query"
+)
+NWI_MAPPER_URL = (
+    "https://www.fws.gov/program/national-wetlands-inventory/wetlands-mapper"
+)
+
+# Cowardin system codes (first char of the ATTRIBUTE code).
+WETLAND_SYSTEMS = {
+    "M": "Marine",
+    "E": "Estuarine",
+    "R": "Riverine",
+    "L": "Lacustrine",
+    "P": "Palustrine",
+    "U": "Upland (non-wetland)",
+}
+
+# Cowardin class codes (two-letter class following the system/subsystem).
+WETLAND_CLASSES = {
+    "AB": "Aquatic Bed",
+    "EM": "Emergent",
+    "FO": "Forested",
+    "ML": "Mudflat",
+    "OW": "Open Water",
+    "RF": "Reef",
+    "RB": "Rock Bottom",
+    "SB": "Streambed",
+    "SC": "Scrub-Shrub",
+    "SS": "Scrub-Shrub",
+    "UB": "Unconsolidated Bottom",
+    "US": "Unconsolidated Shore",
+}
+
+# Cowardin water-regime codes (single letter following the class/subclass).
+WATER_REGIMES = {
+    "A": "Temporarily Flooded",
+    "B": "Seasonally Saturated",
+    "C": "Seasonally Flooded",
+    "D": "Continuously Saturated",
+    "E": "Seasonally Flooded / Saturated",
+    "F": "Semi-permanently Flooded",
+    "G": "Intermittently Exposed",
+    "H": "Permanently Flooded",
+    "J": "Intermittently Flooded",
+    "K": "Artificially Flooded",
+    "L": "Subtidal",
+    "M": "Irregularly Exposed",
+    "N": "Regularly Flooded",
+    "P": "Irregularly Flooded",
+    "R": "Tidal Freshwater",
+    "S": "Temporarily Flooded/Saturated",
+    "T": "Seasonally Flooded/Saturated",
+    "V": "Permanently Flooded/Tidal",
+    "W": "Seasonally Flooded/Tidal",
+    "X": "Regularly Flooded/Tidal",
+    "Y": "Permanently Flooded/Tidal",
+    "Z": "Intermittently Flooded/Tidal",
+}
+
+# Special modifiers appended to a Cowardin code (as "/x" or a trailing letter).
+WETLAND_SPECIAL_MODIFIERS = {
+    "d": "Diked/Impounded",
+    "r": "Partly Drained",
+    "x": "Excavated",
+    "f": "Farmed",
+}
+
+# Short definitions for the common classes, used to enrich the description.
+_WETLAND_CLASS_DEFS = {
+    "EM": "Characterized by erect, rooted, herbaceous hydrophytes.",
+    "FO": "Characterized by woody vegetation at least 6 m (20 ft) tall.",
+    "SS": "Characterized by woody vegetation less than 6 m (20 ft) tall.",
+    "SC": "Characterized by woody vegetation less than 6 m (20 ft) tall.",
+    "AB": "Characterized by plants growing on or below the water surface.",
+    "OW": "Open water with less than 30% areal cover of vegetation.",
+    "UB": "Bottom with less than 25% cover of stones/boulders and no vegetation.",
+    "US": "Shore with less than 75% cover of vegetation or bedrock.",
+}
+
+
+def _nwi_attr(attrs: dict, field: str):
+    """Read a field from an NWI feature, tolerating table-qualified names.
+
+    The NWI layer joins the Wetlands polygons to a codes table, so ArcGIS
+    returns keys like `Wetlands.ATTRIBUTE` and `NWI_Wetland_Codes.SYSTEM`.
+    Fall back to the plain field name too.
+    """
+    if not isinstance(attrs, dict):
+        return None
+    if field in attrs:
+        return attrs[field]
+    for prefix in ("Wetlands.", "NWI_Wetland_Codes."):
+        if prefix + field in attrs:
+            return attrs[prefix + field]
+    # Last resort: match on the unqualified suffix.
+    for k, v in attrs.items():
+        if k.split(".")[-1] == field:
+            return v
+    return None
+
+
+def _parse_cowardin(code):
+    """Parse an NWI Cowardin ATTRIBUTE code into its components.
+
+    Returns a dict with system_code, system, class_code, class, water_regime,
+    and special_modifiers. Handles optional subsystem digit (M/E/R/L),
+    subclass digit(s), trailing modifier letters, and slash modifiers.
+    """
+    out = {
+        "system_code": None,
+        "system": None,
+        "class_code": None,
+        "class": None,
+        "water_regime": None,
+        "special_modifiers": [],
+    }
+    if not code:
+        return out
+
+    raw = str(code).strip()
+    parts = raw.split("/")
+    base = parts[0]
+    slash_segments = parts[1:]
+
+    mods = []
+    for seg in slash_segments:
+        if not seg:
+            continue
+        m = WETLAND_SPECIAL_MODIFIERS.get(seg[0].lower())
+        mods.append(m if m else f"Modifier '{seg}'")
+
+    i, n = 0, len(base)
+
+    # System (first char).
+    if i < n and base[i].isalpha():
+        sys_char = base[i].upper()
+        out["system_code"] = sys_char
+        out["system"] = WETLAND_SYSTEMS.get(sys_char)
+        i += 1
+    else:
+        sys_char = ""
+
+    # Optional subsystem digit for Marine/Estuarine/Riverine/Lacustrine.
+    if sys_char in ("M", "E", "R", "L") and i < n and base[i].isdigit():
+        i += 1
+
+    # Class: up to two alpha characters.
+    if i < n and base[i].isalpha():
+        cls = base[i : i + 2]
+        if len(cls) == 2 and cls[1].isalpha():
+            i += 2
+        else:
+            cls = base[i]
+            i += 1
+        out["class_code"] = cls.upper()
+        out["class"] = WETLAND_CLASSES.get(cls.upper())
+
+    # Subclass digit(s).
+    while i < n and base[i].isdigit():
+        i += 1
+
+    # Water regime: single alpha character.
+    if i < n and base[i].isalpha():
+        wr = base[i].upper()
+        out["water_regime"] = WATER_REGIMES.get(wr)
+        i += 1
+
+    # Trailing letters are special modifiers.
+    while i < n:
+        m = WETLAND_SPECIAL_MODIFIERS.get(base[i].lower())
+        if m:
+            mods.append(m)
+        i += 1
+
+    out["special_modifiers"] = mods
+    return out
+
+
+def _wetland_description(parsed, wetland_type):
+    """Build a human-readable wetland description from parsed components."""
+    system = parsed.get("system") or "Wetland"
+    wclass = parsed.get("class") or ""
+    regime = parsed.get("water_regime")
+
+    lead = f"{system} {wclass}".strip()
+    desc = f"{lead} wetland" if wclass else f"{lead}"
+    if regime:
+        desc += f" - {regime.lower()}"
+    desc += "."
+
+    class_def = _WETLAND_CLASS_DEFS.get(parsed.get("class_code") or "")
+    if class_def:
+        desc += " " + class_def
+    if parsed.get("special_modifiers"):
+        desc += " Modifiers: " + ", ".join(parsed["special_modifiers"]) + "."
+    return desc
+
+
+def _wetland_regulatory_note(parsed, wetland_type):
+    """Build a regulatory jurisdiction note for a wetland feature."""
+    system_code = parsed.get("system_code")
+    notes = []
+    if system_code in ("P", "E", "R", "L"):
+        notes.append(
+            "Likely subject to Section 404 CWA jurisdiction. Consult with USACE."
+        )
+    if wetland_type and "freshwater" in str(wetland_type).lower():
+        notes.append(
+            "Freshwater wetland - U.S. Army Corps Section 404 permit may apply."
+        )
+    if system_code in ("E", "M"):
+        notes.append(
+            "Tidal/coastal - Section 10 Rivers & Harbors Act may also apply."
+        )
+    if not notes:
+        notes.append("Consult with USACE for a jurisdictional determination.")
+    return " ".join(notes)
+
+
+def _nwi_query(lat, lon, timeout=30):
+    """Query the USFWS NWI wetlands layer for polygons intersecting a point.
+
+    Returns the parsed ArcGIS JSON dict. Uses outFields=* because the layer's
+    join rejects unqualified field lists; retries on transient TLS resets.
+    """
+    import time as _time
+
+    import requests
+
+    params = {
+        "geometry": json.dumps(
+            {"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}
+        ),
+        "geometryType": "esriGeometryPoint",
+        "inSR": 4326,
+        "outSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "*",
+        "returnGeometry": "true",
+        "f": "json",
+    }
+    last_exc = None
+    for attempt in range(4):
+        try:
+            resp = requests.get(NWI_WETLANDS_URL, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:  # transport / TLS reset / JSON error
+            last_exc = exc
+            _time.sleep(1.5 * (attempt + 1))
+    raise last_exc if last_exc else RuntimeError("NWI request failed")
+
+
+def wetland_lookup(lat, lon) -> dict:
+    """Look up USFWS NWI wetland classification(s) + boundaries for a point."""
+    # ── Validate inputs ──────────────────────────────────────────────
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except (TypeError, ValueError):
+        return _tool_json(
+            {"error": "Both 'lat' and 'lon' are required and must be numbers."},
+            is_error=True,
+        )
+
+    if not (-90.0 <= lat_f <= 90.0) or not (-180.0 <= lon_f <= 180.0):
+        return _tool_json(
+            {
+                "error": (
+                    "Coordinates out of range. lat must be in [-90, 90] and "
+                    "lon in [-180, 180]."
+                ),
+                "location": {"lat": lat_f, "lon": lon_f},
+            },
+            is_error=True,
+        )
+
+    # ── Query USFWS NWI ──────────────────────────────────────────────
+    try:
+        data = _nwi_query(lat_f, lon_f)
+    except Exception as exc:
+        return _tool_json(
+            {
+                "error": (
+                    "USFWS National Wetlands Inventory service is unreachable. "
+                    "Please retry later or check the location at the NWI "
+                    "Wetlands Mapper."
+                ),
+                "detail": str(exc),
+                "location": {"lat": lat_f, "lon": lon_f},
+                "nwi_mapper": NWI_MAPPER_URL,
+            },
+            is_error=True,
+        )
+
+    if isinstance(data, dict) and data.get("error"):
+        return _tool_json(
+            {
+                "error": "USFWS NWI query failed.",
+                "detail": data.get("error"),
+                "location": {"lat": lat_f, "lon": lon_f},
+                "nwi_mapper": NWI_MAPPER_URL,
+            },
+            is_error=True,
+        )
+
+    features = (data or {}).get("features") or []
+    if not features:
+        return _tool_json(
+            {
+                "location": {"lat": lat_f, "lon": lon_f},
+                "wetlands": [],
+                "summary": (
+                    "No NWI wetland features mapped at this location. Field "
+                    "verification recommended."
+                ),
+                "no_wetlands_found": True,
+                "source": "USFWS National Wetlands Inventory (NWI)",
+                "nwi_mapper": NWI_MAPPER_URL,
+            }
+        )
+
+    # ── Assemble wetland features ────────────────────────────────────
+    wetlands = []
+    for feat in features:
+        attrs = feat.get("attributes") or {}
+        geom = feat.get("geometry") or {}
+        code = _nwi_attr(attrs, "ATTRIBUTE")
+        wetland_type = _nwi_attr(attrs, "WETLAND_TYPE")
+        acres_raw = _nwi_attr(attrs, "ACRES")
+        try:
+            acres = round(float(acres_raw), 2) if acres_raw is not None else None
+        except (TypeError, ValueError):
+            acres = None
+
+        parsed = _parse_cowardin(code)
+        wetlands.append(
+            {
+                "attribute_code": code,
+                "wetland_type": wetland_type,
+                "system": parsed.get("system"),
+                "class": parsed.get("class"),
+                "water_regime": parsed.get("water_regime"),
+                "special_modifiers": parsed.get("special_modifiers", []),
+                "acres": acres,
+                "description": _wetland_description(parsed, wetland_type),
+                "regulatory_note": _wetland_regulatory_note(parsed, wetland_type),
+                "geometry": _esri_rings_to_geojson(geom.get("rings")),
+            }
+        )
+
+    n = len(wetlands)
+    summary = (
+        f"{n} wetland feature{'s' if n != 1 else ''} found. "
+        "Wetlands present - Section 404 review likely required."
+    )
+
+    return _tool_json(
+        {
+            "location": {"lat": lat_f, "lon": lon_f},
+            "wetlands": wetlands,
+            "summary": summary,
+            "no_wetlands_found": False,
+            "source": "USFWS National Wetlands Inventory (NWI)",
+            "nwi_mapper": NWI_MAPPER_URL,
+        }
+    )
+
+
 def _handle_rpc(message: dict) -> Optional[dict]:
     """Handle a single JSON-RPC message. Returns None for notifications."""
     msg_id = message.get("id")
@@ -961,6 +1374,14 @@ def _handle_rpc(message: dict) -> Optional[dict]:
             return _rpc_result(
                 msg_id,
                 fema_flood_lookup(
+                    arguments.get("lat"),
+                    arguments.get("lon"),
+                ),
+            )
+        if name == "wetland_lookup":
+            return _rpc_result(
+                msg_id,
+                wetland_lookup(
                     arguments.get("lat"),
                     arguments.get("lon"),
                 ),
