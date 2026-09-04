@@ -187,7 +187,7 @@ PAGE = """<!DOCTYPE html>
         <div class="tile">
             <span class="tile-label">Offering</span>
             <span class="tile-name">MCP Server</span>
-            <p class="tile-desc">Custom Model Context Protocol servers that give your AI agents secure, structured access to tools, data, and workflows. Live tools at <a href="/mcp">/mcp</a> (streamable HTTP, JSON-RPC 2.0): <code>state_capital_lookup</code> and <code>soil_lookup</code> — USDA SSURGO soil types &amp; GeoJSON boundaries by lat/lon.</p>
+            <p class="tile-desc">Custom Model Context Protocol servers that give your AI agents secure, structured access to tools, data, and workflows. Live tools at <a href="/mcp">/mcp</a> (streamable HTTP, JSON-RPC 2.0): <code>state_capital_lookup</code>, <code>soil_lookup</code> — USDA SSURGO soil types &amp; GeoJSON boundaries by lat/lon, and <code>fema_flood_lookup</code> — FEMA NFHL flood zones &amp; GeoJSON boundaries by lat/lon.</p>
         </div>
         <div class="tile">
             <span class="tile-label">Offering</span>
@@ -236,6 +236,20 @@ no relationship with us required.
   lat/lon and draw the returned soil polygons directly in a drawing.
 - Coverage is the U.S. and its territories; offshore or international
   points return no soil units.
+
+### fema_flood_lookup
+
+- Args: lat (number), lon (number). Coordinates are WGS84 decimal degrees.
+- Returns: FEMA National Flood Hazard Layer (NFHL) flood zone(s) at that
+  point -- flood zone designation (e.g. AE, X, VE, AO), zone subtype,
+  human-readable risk level and description, Special Flood Hazard Area
+  (SFHA) flag, base flood elevation, FIRM panel and source citation --
+  plus GeoJSON polygon boundaries for each flood zone, backed by FEMA's
+  public NFHL ArcGIS service (authoritative flood-map data).
+- Intended for CAD/GIS agents: e.g. Civil 3D / Dynamo can call this with a
+  lat/lon and draw the returned flood-zone polygons directly in a drawing.
+- Coverage is mapped U.S. communities; unmapped, offshore, or international
+  points return no flood zones.
 
 ## Services
 
@@ -323,6 +337,29 @@ TOOLS = [
                     "description": (
                         "Search radius in meters around the point (default: 500)"
                     ),
+                },
+            },
+            "required": ["lat", "lon"],
+        },
+    },
+    {
+        "name": "fema_flood_lookup",
+        "description": (
+            "Look up FEMA National Flood Hazard Layer (NFHL) flood zone "
+            "classifications and boundaries for a given latitude and longitude. "
+            "Returns flood zone designation, risk level, and GeoJSON polygon "
+            "boundaries."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lat": {
+                    "type": "number",
+                    "description": "Latitude (WGS84, decimal degrees)",
+                },
+                "lon": {
+                    "type": "number",
+                    "description": "Longitude (WGS84, decimal degrees)",
                 },
             },
             "required": ["lat", "lon"],
@@ -624,6 +661,262 @@ WHERE mp.mupolygonkey IN (
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# FEMA National Flood Hazard Layer (NFHL) -- public ArcGIS REST service,
+# no API key required. Layer 28 is the Flood Hazard Zones layer.
+# ─────────────────────────────────────────────────────────────────────────
+FEMA_NFHL_URL = (
+    "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/"
+    "MapServer/28/query"
+)
+FEMA_MSC_URL = "https://msc.fema.gov/portal/home"
+
+# ArcGIS "no data" sentinel used for numeric fields like BFE / depth / velocity.
+_FEMA_NODATA = -9999.0
+
+FLOOD_ZONE_DESCRIPTIONS = {
+    "A": "High risk - Special Flood Hazard Area (SFHA). 1% annual chance flood.",
+    "AE": "High risk - SFHA with Base Flood Elevations. 1% annual chance flood.",
+    "AH": "High risk - SFHA with shallow flooding (ponding). 1% annual chance flood.",
+    "AO": "High risk - SFHA with sheet flow flooding. 1% annual chance flood.",
+    "AR": "High risk - SFHA with temporary increased risk due to levee failure.",
+    "A99": "High risk - SFHA protected by Federal flood control system under construction.",
+    "V": "Very high risk - Coastal SFHA with wave action. 1% annual chance flood.",
+    "VE": "Very high risk - Coastal SFHA with wave action and BFE. 1% annual chance flood.",
+    "B": "Moderate risk - Area between 1% and 0.2% annual chance flood.",
+    "C": "Minimal risk - Area of minimal flood hazard.",
+    "X": "Minimal to moderate risk. Zone X (shaded) = 0.2% annual chance. Zone X (unshaded) = minimal hazard.",
+    "D": "Undetermined risk - Possible flood hazards but not analyzed.",
+}
+
+# Short, human-readable risk level per zone code.
+_FLOOD_RISK_LEVELS = {
+    "A": "High risk",
+    "AE": "High risk",
+    "AH": "High risk",
+    "AO": "High risk",
+    "AR": "High risk",
+    "A99": "High risk",
+    "V": "Very high risk",
+    "VE": "Very high risk",
+    "B": "Moderate risk",
+    "C": "Minimal risk",
+    "X": "Minimal to moderate risk",
+    "D": "Undetermined risk",
+}
+
+
+def _flood_risk_level(zone):
+    """Return a short risk-level label for a FEMA flood zone code."""
+    if not zone:
+        return "Unknown"
+    return _FLOOD_RISK_LEVELS.get(str(zone).strip().upper(), "Unknown")
+
+
+def _flood_zone_description(zone):
+    """Return the human-readable description for a FEMA flood zone code."""
+    if not zone:
+        return "Unknown flood zone."
+    return FLOOD_ZONE_DESCRIPTIONS.get(
+        str(zone).strip().upper(),
+        f"Flood zone {zone} - see FEMA for details.",
+    )
+
+
+def _fema_num(value):
+    """Return a numeric field, or None if it is missing / the -9999 sentinel."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f == _FEMA_NODATA:
+        return None
+    return f
+
+
+def _esri_rings_to_geojson(rings):
+    """Convert an ESRI polygon's `rings` to a GeoJSON geometry.
+
+    ESRI already returns coordinates as [x, y] = [lon, lat] (outSR=4326), which
+    is the order GeoJSON expects. Per the NFHL feature model a flood-zone
+    polygon's first ring is the exterior boundary and any remaining rings are
+    interior holes, so we emit a single GeoJSON Polygon (exterior + holes) that
+    a CAD/GIS consumer can draw directly.
+    """
+    if not rings:
+        return None
+
+    def _close(ring):
+        # GeoJSON linear rings must be explicitly closed.
+        if ring and ring[0] != ring[-1]:
+            return ring + [ring[0]]
+        return ring
+
+    coords = [_close([list(pt) for pt in ring]) for ring in rings if ring]
+    coords = [r for r in coords if len(r) >= 4]
+    if not coords:
+        return None
+    return {"type": "Polygon", "coordinates": coords}
+
+
+def _fema_query(lat, lon, timeout=30):
+    """Query the FEMA NFHL layer 28 for flood zones intersecting a point.
+
+    Returns the parsed ArcGIS JSON dict. Retries a few times because the FEMA
+    endpoint intermittently resets TLS connections.
+    """
+    import time as _time
+
+    import requests
+
+    params = {
+        "geometry": json.dumps(
+            {"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}
+        ),
+        "geometryType": "esriGeometryPoint",
+        "inSR": 4326,
+        "outSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        # Request all fields; NFHL layer 28 lacks some FIRM-panel columns, and
+        # asking for a non-existent field makes ArcGIS reject the whole query.
+        "outFields": "*",
+        "returnGeometry": "true",
+        "f": "json",
+    }
+    last_exc = None
+    for attempt in range(4):
+        try:
+            resp = requests.get(FEMA_NFHL_URL, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:  # transport / TLS reset / JSON error
+            last_exc = exc
+            _time.sleep(1.5 * (attempt + 1))
+    raise last_exc if last_exc else RuntimeError("FEMA NFHL request failed")
+
+
+def fema_flood_lookup(lat, lon) -> dict:
+    """Look up FEMA NFHL flood zone(s) + boundaries for a coordinate."""
+    # ── Validate inputs ──────────────────────────────────────────────
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except (TypeError, ValueError):
+        return _tool_json(
+            {"error": "Both 'lat' and 'lon' are required and must be numbers."},
+            is_error=True,
+        )
+
+    if not (-90.0 <= lat_f <= 90.0) or not (-180.0 <= lon_f <= 180.0):
+        return _tool_json(
+            {
+                "error": (
+                    "Coordinates out of range. lat must be in [-90, 90] and "
+                    "lon in [-180, 180]."
+                ),
+                "location": {"lat": lat_f, "lon": lon_f},
+            },
+            is_error=True,
+        )
+
+    # ── Query FEMA NFHL ──────────────────────────────────────────────
+    try:
+        data = _fema_query(lat_f, lon_f)
+    except Exception as exc:
+        return _tool_json(
+            {
+                "error": (
+                    "FEMA National Flood Hazard Layer service is unreachable. "
+                    "Please retry later or check the location at the FEMA Flood "
+                    "Map Service Center."
+                ),
+                "detail": str(exc),
+                "location": {"lat": lat_f, "lon": lon_f},
+                "fema_flood_map_service_center": FEMA_MSC_URL,
+            },
+            is_error=True,
+        )
+
+    if isinstance(data, dict) and data.get("error"):
+        return _tool_json(
+            {
+                "error": "FEMA NFHL query failed.",
+                "detail": data.get("error"),
+                "location": {"lat": lat_f, "lon": lon_f},
+                "fema_flood_map_service_center": FEMA_MSC_URL,
+            },
+            is_error=True,
+        )
+
+    features = (data or {}).get("features") or []
+    if not features:
+        return _tool_json(
+            {
+                "location": {"lat": lat_f, "lon": lon_f},
+                "flood_zones": [],
+                "summary": (
+                    "No FEMA flood zone data found at this location. It may fall "
+                    "outside NFHL coverage (unmapped community, offshore, or "
+                    "international)."
+                ),
+                "source": "FEMA National Flood Hazard Layer (NFHL)",
+                "fema_flood_map_service_center": FEMA_MSC_URL,
+            }
+        )
+
+    # ── Assemble flood zones ─────────────────────────────────────────
+    flood_zones = []
+    any_sfha = False
+    zone_codes = []
+    for feat in features:
+        attrs = feat.get("attributes") or {}
+        geom = feat.get("geometry") or {}
+        zone = attrs.get("FLD_ZONE")
+        sfha = str(attrs.get("SFHA_TF") or "").strip().upper() == "T"
+        if sfha:
+            any_sfha = True
+        if zone:
+            zone_codes.append(str(zone).strip().upper())
+        flood_zones.append(
+            {
+                "flood_zone": zone,
+                "zone_subtype": attrs.get("ZONE_SUBTY"),
+                "risk_level": _flood_risk_level(zone),
+                "risk_description": _flood_zone_description(zone),
+                "special_flood_hazard_area": sfha,
+                "base_flood_elevation": _fema_num(attrs.get("STATIC_BFE")),
+                "firm_panel": attrs.get("FIRM_PAN"),
+                "source_citation": attrs.get("SOURCE_CIT"),
+                "geometry": _esri_rings_to_geojson(geom.get("rings")),
+            }
+        )
+
+    n = len(flood_zones)
+    zone_list = ", ".join(sorted(set(c for c in zone_codes if c))) or "unclassified"
+    if any_sfha:
+        summary = (
+            f"{n} flood zone{'s' if n != 1 else ''} found ({zone_list}). "
+            "HIGH RISK - Special Flood Hazard Area (SFHA) present."
+        )
+    else:
+        summary = (
+            f"{n} flood zone{'s' if n != 1 else ''} found ({zone_list}). "
+            "No Special Flood Hazard Area (SFHA) at this location."
+        )
+
+    return _tool_json(
+        {
+            "location": {"lat": lat_f, "lon": lon_f},
+            "flood_zones": flood_zones,
+            "summary": summary,
+            "source": "FEMA National Flood Hazard Layer (NFHL)",
+            "fema_flood_map_service_center": FEMA_MSC_URL,
+        }
+    )
+
+
 def _handle_rpc(message: dict) -> Optional[dict]:
     """Handle a single JSON-RPC message. Returns None for notifications."""
     msg_id = message.get("id")
@@ -662,6 +955,14 @@ def _handle_rpc(message: dict) -> Optional[dict]:
                     arguments.get("lat"),
                     arguments.get("lon"),
                     arguments.get("radius_meters", 500),
+                ),
+            )
+        if name == "fema_flood_lookup":
+            return _rpc_result(
+                msg_id,
+                fema_flood_lookup(
+                    arguments.get("lat"),
+                    arguments.get("lon"),
                 ),
             )
         return _rpc_error(msg_id, -32602, f"Unknown tool: {name}")
