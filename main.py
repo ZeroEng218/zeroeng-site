@@ -13,6 +13,8 @@ Run locally:
     uvicorn main:app --reload
 """
 
+import json
+import math
 import os
 from typing import Any, Optional
 
@@ -185,7 +187,7 @@ PAGE = """<!DOCTYPE html>
         <div class="tile">
             <span class="tile-label">Offering</span>
             <span class="tile-name">MCP Server</span>
-            <p class="tile-desc">Custom Model Context Protocol servers that give your AI agents secure, structured access to tools, data, and workflows. Live demo: the <code>state_capital_lookup</code> tool at <a href="/mcp">/mcp</a> (streamable HTTP, JSON-RPC 2.0).</p>
+            <p class="tile-desc">Custom Model Context Protocol servers that give your AI agents secure, structured access to tools, data, and workflows. Live tools at <a href="/mcp">/mcp</a> (streamable HTTP, JSON-RPC 2.0): <code>state_capital_lookup</code> and <code>soil_lookup</code> — USDA SSURGO soil types &amp; GeoJSON boundaries by lat/lon.</p>
         </div>
         <div class="tile">
             <span class="tile-label">Offering</span>
@@ -208,21 +210,32 @@ LLMS_TXT = """# Zero Engineering
 Zero Engineering builds AI agent tooling for companies that serve the
 built environment (architecture, engineering, construction). Some of that
 tooling is published as public MCP servers any agent can call directly --
-no relationship with us required beyond a free, instant API key.
+no relationship with us required.
 
-## Live tools
+## Live tools (MCP)
 
-### Geo Lookup (MCP)
+- Endpoint: /mcp (streamable HTTP, JSON-RPC 2.0)
+- No API key required. Standard MCP handshake: `initialize`, then
+  `tools/list`, then `tools/call`.
 
-- Endpoint: https://mcp.zeroeng.io/mcp (streamable-http)
-- Auth: POST https://mcp.zeroeng.io/register with {"name": "...", "email": "..."}
-  to get a free API key instantly. Send it back as
-  `Authorization: Bearer <api_key>` on requests to /mcp.
-- Tool: get_state_for_coordinates(latitude, longitude) -> the U.S. state and
-  county a coordinate falls within, backed by the FCC/Census Bureau's
-  authoritative boundary data (not model guesswork).
-- More location-based operations (jurisdiction lookup, permitting rules,
-  code requirements) are planned on the same endpoint.
+### state_capital_lookup
+
+- Args: state (string) -- the name of a U.S. state.
+- Returns: the capital city of that state, from an authoritative table
+  (not model guesswork).
+
+### soil_lookup
+
+- Args: lat (number), lon (number), radius_meters (number, optional,
+  default 500). Coordinates are WGS84 decimal degrees.
+- Returns: USDA SSURGO soil map units at that point -- map unit name,
+  dominant component, drainage class, hydric rating, taxonomic order and
+  class, surface texture -- plus GeoJSON polygon boundaries for each map
+  unit, backed by the USDA Soil Data Access API (authoritative survey data).
+- Intended for CAD/GIS agents: e.g. Civil 3D / Dynamo can call this with a
+  lat/lon and draw the returned soil polygons directly in a drawing.
+- Coverage is the U.S. and its territories; offshore or international
+  points return no soil units.
 
 ## Services
 
@@ -286,7 +299,35 @@ TOOLS = [
             },
             "required": ["state"],
         },
-    }
+    },
+    {
+        "name": "soil_lookup",
+        "description": (
+            "Look up USDA SSURGO soil types and boundaries for a given latitude "
+            "and longitude. Returns soil map unit metadata and GeoJSON polygon "
+            "boundaries."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lat": {
+                    "type": "number",
+                    "description": "Latitude (WGS84, decimal degrees)",
+                },
+                "lon": {
+                    "type": "number",
+                    "description": "Longitude (WGS84, decimal degrees)",
+                },
+                "radius_meters": {
+                    "type": "number",
+                    "description": (
+                        "Search radius in meters around the point (default: 500)"
+                    ),
+                },
+            },
+            "required": ["lat", "lon"],
+        },
+    },
 ]
 
 
@@ -341,6 +382,248 @@ def state_capital_lookup(state: str) -> dict:
     )
 
 
+def _tool_json(payload: dict, is_error: bool = False) -> dict:
+    """Build an MCP tools/call result whose text content is a JSON string.
+
+    Agents (and Civil 3D / Dynamo consumers) can json.loads the text to get
+    the structured soil result, including GeoJSON geometry.
+    """
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload)}],
+        "isError": is_error,
+    }
+
+
+# USDA Soil Data Access (SDA) endpoint -- public, no auth required.
+SDA_TABULAR_URL = "https://SDMDataAccess.sc.egov.usda.gov/Tabular/post.rest"
+WEB_SOIL_SURVEY_URL = "https://websoilsurvey.sc.egov.usda.gov/"
+
+
+def _sda_query(sql: str, timeout: int = 30):
+    """POST an SQL query to the USDA SDA REST API and return parsed rows.
+
+    With FORMAT=JSON+COLUMNNAME, SDA returns {"Table": [[col, col, ...], ...]}
+    where the FIRST row is the column headers. Returns a list of dicts. Raises
+    on transport failure; returns [] when SDA reports no data.
+    """
+    import requests
+
+    resp = requests.post(
+        SDA_TABULAR_URL,
+        data={"query": sql, "FORMAT": "JSON+COLUMNNAME"},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    # SDA returns an empty body (not JSON) when there are no matching rows.
+    text = (resp.text or "").strip()
+    if not text:
+        return []
+    try:
+        data = resp.json()
+    except ValueError:
+        return []
+    table = data.get("Table") if isinstance(data, dict) else None
+    if not table or len(table) < 2:
+        return []
+    headers = table[0]
+    return [dict(zip(headers, row)) for row in table[1:]]
+
+
+def _wkts_to_geojson(wkt_list):
+    """Combine one or more WKT polygon strings into a single GeoJSON geometry.
+
+    A soil map unit (mukey) can be made up of several disjoint polygons within
+    the search area. We keep each polygon distinct (no dissolve) so a CAD/GIS
+    consumer can draw every boundary: one Polygon becomes a GeoJSON Polygon,
+    several become a MultiPolygon.
+    """
+    if not wkt_list:
+        return None
+    try:
+        from shapely import wkt as shapely_wkt
+        from shapely.geometry import MultiPolygon, mapping
+
+        polys = []
+        for w in wkt_list:
+            if not w:
+                continue
+            try:
+                geom = shapely_wkt.loads(w)
+            except Exception:
+                continue
+            if geom.geom_type == "Polygon":
+                polys.append(geom)
+            elif geom.geom_type == "MultiPolygon":
+                polys.extend(list(geom.geoms))
+        if not polys:
+            return None
+        if len(polys) == 1:
+            return mapping(polys[0])
+        return mapping(MultiPolygon(polys))
+    except Exception:
+        return None
+
+
+def soil_lookup(lat, lon, radius_meters=500) -> dict:
+    """Look up USDA SSURGO soil map units + boundaries for a coordinate.
+
+    Two-step SDA query: (1) tabular soil/component attributes, (2) polygon
+    geometry as WKT -> converted to GeoJSON. Results are keyed by mukey.
+    """
+    # ── Validate inputs ──────────────────────────────────────────────
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except (TypeError, ValueError):
+        return _tool_json(
+            {
+                "error": "Both 'lat' and 'lon' are required and must be numbers.",
+            },
+            is_error=True,
+        )
+
+    if not (-90.0 <= lat_f <= 90.0) or not (-180.0 <= lon_f <= 180.0):
+        return _tool_json(
+            {
+                "error": (
+                    "Coordinates out of range. lat must be in [-90, 90] and "
+                    "lon in [-180, 180]."
+                ),
+                "location": {"lat": lat_f, "lon": lon_f},
+            },
+            is_error=True,
+        )
+
+    try:
+        radius_f = float(radius_meters) if radius_meters is not None else 500.0
+    except (TypeError, ValueError):
+        radius_f = 500.0
+
+    # Build a small WGS84 bounding box of the requested radius around the
+    # point. The box scopes BOTH the attribute and geometry queries, so
+    # radius_meters is honored and the returned geometry stays local (rather
+    # than every polygon of a map unit across the entire survey area).
+    dlat = radius_f / 111320.0
+    dlon = radius_f / (111320.0 * max(math.cos(math.radians(lat_f)), 1e-6))
+    minx, maxx = lon_f - dlon, lon_f + dlon
+    miny, maxy = lat_f - dlat, lat_f + dlat
+    box_wkt = (
+        f"polygon(({minx} {miny}, {maxx} {miny}, {maxx} {maxy}, "
+        f"{minx} {maxy}, {minx} {miny}))"
+    )
+
+    # ── Step 1: tabular attributes for map units within the radius ───
+    attr_sql = f"""SELECT mu.mukey, mu.muname, c.compname, c.majcompflag, c.drainagecl, c.hydricrating,
+       c.taxorder, c.taxclname, soi.texture
+FROM mapunit mu
+INNER JOIN component c ON c.mukey = mu.mukey AND c.majcompflag = 'Yes'
+LEFT JOIN chorizon ch ON ch.cokey = c.cokey AND ch.hzdept_r = 0
+LEFT JOIN chtexturegrp soi ON soi.chkey = ch.chkey AND soi.rvindicator = 'Yes'
+WHERE mu.mukey IN (
+  SELECT mukey FROM SDA_Get_Mukey_from_intersection_with_WktWgs84('{box_wkt}')
+)"""
+
+    # ── Step 2: polygon geometry (WKT) for polygons within the radius ─
+    geom_sql = f"""SELECT mp.mukey, mp.mupolygongeo.STAsText() as wkt_geometry
+FROM mupolygon mp
+WHERE mp.mupolygonkey IN (
+  SELECT mupolygonkey FROM SDA_Get_Mupolygonkey_from_intersection_with_WktWgs84('{box_wkt}')
+)"""
+
+    try:
+        attr_rows = _sda_query(attr_sql)
+    except Exception as exc:
+        return _tool_json(
+            {
+                "error": (
+                    "USDA Soil Data Access API is unreachable. Please retry "
+                    "later or check the location at the USDA Web Soil Survey."
+                ),
+                "detail": str(exc),
+                "location": {"lat": lat_f, "lon": lon_f},
+                "usda_web_soil_survey": WEB_SOIL_SURVEY_URL,
+            },
+            is_error=True,
+        )
+
+    if not attr_rows:
+        return _tool_json(
+            {
+                "location": {"lat": lat_f, "lon": lon_f},
+                "soil_units": [],
+                "message": (
+                    "No USDA SSURGO soil data is available for this point. "
+                    "SSURGO covers the U.S. and its territories; offshore, "
+                    "international, or unmapped areas return no results."
+                ),
+                "source": "USDA SSURGO via Soil Data Access API",
+                "usda_web_soil_survey": WEB_SOIL_SURVEY_URL,
+            }
+        )
+
+    # Fetch geometry; a geometry failure should not lose the tabular data.
+    # Collect all polygon WKTs per mukey (a unit may span several polygons).
+    wkts_by_mukey = {}
+    try:
+        for g in _sda_query(geom_sql):
+            mukey = str(g.get("mukey", "")).strip()
+            wkt = g.get("wkt_geometry")
+            if mukey and wkt:
+                wkts_by_mukey.setdefault(mukey, []).append(wkt)
+    except Exception:
+        wkts_by_mukey = {}
+
+    geom_by_mukey = {
+        mukey: _wkts_to_geojson(wkts) for mukey, wkts in wkts_by_mukey.items()
+    }
+
+    # ── Assemble one entry per unique mukey ──────────────────────────
+    # Each map unit can list several major components; prefer the row with
+    # the most populated attributes so we surface real soil data (e.g. "Fox,
+    # Well drained") rather than a sparse "Urban land" row with null fields.
+    def _completeness(row):
+        return sum(
+            1
+            for k in ("drainagecl", "hydricrating", "taxorder", "taxclname", "texture")
+            if row.get(k) not in (None, "")
+        )
+
+    best_row = {}
+    for r in attr_rows:
+        mukey = str(r.get("mukey", "")).strip()
+        if not mukey:
+            continue
+        if mukey not in best_row or _completeness(r) > _completeness(best_row[mukey]):
+            best_row[mukey] = r
+
+    soil_units = []
+    for mukey, r in best_row.items():
+        soil_units.append(
+            {
+                "mukey": mukey,
+                "muname": r.get("muname"),
+                "component_name": r.get("compname"),
+                "drainage_class": r.get("drainagecl"),
+                "hydric_rating": r.get("hydricrating"),
+                "tax_order": r.get("taxorder"),
+                "tax_class": r.get("taxclname"),
+                "surface_texture": r.get("texture"),
+                "geometry": geom_by_mukey.get(mukey),
+            }
+        )
+
+    return _tool_json(
+        {
+            "location": {"lat": lat_f, "lon": lon_f},
+            "radius_meters": radius_f,
+            "soil_units": soil_units,
+            "source": "USDA SSURGO via Soil Data Access API",
+            "usda_web_soil_survey": WEB_SOIL_SURVEY_URL,
+        }
+    )
+
+
 def _handle_rpc(message: dict) -> Optional[dict]:
     """Handle a single JSON-RPC message. Returns None for notifications."""
     msg_id = message.get("id")
@@ -372,6 +655,15 @@ def _handle_rpc(message: dict) -> Optional[dict]:
         arguments = params.get("arguments") or {}
         if name == "state_capital_lookup":
             return _rpc_result(msg_id, state_capital_lookup(arguments.get("state", "")))
+        if name == "soil_lookup":
+            return _rpc_result(
+                msg_id,
+                soil_lookup(
+                    arguments.get("lat"),
+                    arguments.get("lon"),
+                    arguments.get("radius_meters", 500),
+                ),
+            )
         return _rpc_error(msg_id, -32602, f"Unknown tool: {name}")
 
     return _rpc_error(msg_id, -32601, f"Method not found: {method}")
