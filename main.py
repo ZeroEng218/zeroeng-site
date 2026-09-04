@@ -187,7 +187,7 @@ PAGE = """<!DOCTYPE html>
         <div class="tile">
             <span class="tile-label">Offering</span>
             <span class="tile-name">MCP Server</span>
-            <p class="tile-desc">Custom Model Context Protocol servers that give your AI agents secure, structured access to tools, data, and workflows. Live tools at <a href="/mcp">/mcp</a> (streamable HTTP, JSON-RPC 2.0): <code>state_capital_lookup</code>; <code>soil_lookup</code> — USDA SSURGO soil types &amp; GeoJSON boundaries by lat/lon; <code>fema_flood_lookup</code> — FEMA NFHL flood zones &amp; GeoJSON boundaries by lat/lon; and <code>wetland_lookup</code> — USFWS NWI wetland classifications &amp; GeoJSON boundaries by lat/lon.</p>
+            <p class="tile-desc">Custom Model Context Protocol servers that give your AI agents secure, structured access to tools, data, and workflows. Live tools at <a href="/mcp">/mcp</a> (streamable HTTP, JSON-RPC 2.0): <code>state_capital_lookup</code>; <code>soil_lookup</code> — USDA SSURGO soil types &amp; GeoJSON boundaries by lat/lon; <code>fema_flood_lookup</code> — FEMA NFHL flood zones &amp; GeoJSON boundaries by lat/lon; <code>wetland_lookup</code> — USFWS NWI wetland classifications &amp; GeoJSON boundaries by lat/lon; and <code>osm_lookup</code> — OpenStreetMap roads, buildings, utilities, waterways &amp; land use as GeoJSON by lat/lon.</p>
         </div>
         <div class="tile">
             <span class="tile-label">Offering</span>
@@ -265,6 +265,24 @@ no relationship with us required.
   lat/lon and draw the returned wetland polygons directly in a drawing.
 - Coverage is mapped U.S. areas; unmapped, offshore, or international points
   return no wetlands (field verification still recommended).
+
+### osm_lookup
+
+- Args: lat (number), lon (number), radius_meters (number, optional,
+  default 200, max 1000), categories (array of strings, optional). Category
+  options: roads, buildings, waterways, utilities, landuse, railways,
+  amenities. Omit categories to query all. Coordinates are WGS84 decimal
+  degrees.
+- Returns: OpenStreetMap features near the point via the Overpass API --
+  each with OSM id/type, category, feature type, name, raw tags, and GeoJSON
+  geometry (Point for nodes, LineString/Polygon for ways) -- plus a
+  per-category feature_summary count. Capped at 200 features per call.
+- Intended for CAD/GIS agents: e.g. Civil 3D / Dynamo can call this with a
+  lat/lon and draw roads, utilities, buildings, and waterways as separate
+  labeled layers directly in a drawing.
+- Data (c) OpenStreetMap contributors, licensed ODbL
+  (https://www.openstreetmap.org/copyright).
+- Worldwide coverage; density varies by area.
 
 ## Services
 
@@ -398,6 +416,42 @@ TOOLS = [
                 "lon": {
                     "type": "number",
                     "description": "Longitude (WGS84, decimal degrees)",
+                },
+            },
+            "required": ["lat", "lon"],
+        },
+    },
+    {
+        "name": "osm_lookup",
+        "description": (
+            "Query OpenStreetMap (OSM) data for infrastructure, roads, "
+            "buildings, utilities, waterways, and land use features near a "
+            "given latitude and longitude. Returns feature metadata and "
+            "GeoJSON geometries."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lat": {
+                    "type": "number",
+                    "description": "Latitude (WGS84, decimal degrees)",
+                },
+                "lon": {
+                    "type": "number",
+                    "description": "Longitude (WGS84, decimal degrees)",
+                },
+                "radius_meters": {
+                    "type": "number",
+                    "description": "Search radius in meters (default: 200, max: 1000)",
+                },
+                "categories": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Feature categories to query. Options: roads, "
+                        "buildings, waterways, utilities, landuse, railways, "
+                        "amenities. Default: all categories."
+                    ),
                 },
             },
             "required": ["lat", "lon"],
@@ -1330,6 +1384,307 @@ def wetland_lookup(lat, lon) -> dict:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# OpenStreetMap (OSM) via the Overpass API -- free, public, no API key.
+# A single bounding-box query pulls infrastructure features (roads,
+# buildings, waterways, utilities, land use, railways, amenities) and their
+# geometry, which we convert to GeoJSON for CAD/GIS consumers.
+# ─────────────────────────────────────────────────────────────────────────
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
+OSM_COPYRIGHT_URL = "https://www.openstreetmap.org/copyright"
+OSM_USER_AGENT = "ZeroEng-MCP/1.0 (admin@zeroeng.io)"
+
+# Cap the number of features returned so responses stay manageable.
+OSM_MAX_FEATURES = 200
+# Radius bounds (meters).
+OSM_DEFAULT_RADIUS = 200.0
+OSM_MAX_RADIUS = 1000.0
+
+# Overpass QL statement fragments per category. `{bbox}` is substituted with
+# the "south,west,north,east" bounding box.
+OSM_CATEGORY_QUERIES = {
+    "roads": [
+        'way["highway"]({bbox});',
+    ],
+    "buildings": [
+        'way["building"]({bbox});',
+        'relation["building"]({bbox});',
+    ],
+    "waterways": [
+        'way["waterway"]({bbox});',
+        'node["waterway"]({bbox});',
+        'relation["waterway"]({bbox});',
+        'way["natural"~"water|wetland|coastline"]({bbox});',
+    ],
+    "utilities": [
+        'way["power"]({bbox});',
+        'node["power"]({bbox});',
+        'way["man_made"~"pipeline|utility_pole|tower"]({bbox});',
+        'node["man_made"~"pipeline|utility_pole|tower"]({bbox});',
+        'node["utility"]({bbox});',
+    ],
+    "landuse": [
+        'way["landuse"]({bbox});',
+        'relation["landuse"]({bbox});',
+    ],
+    "railways": [
+        'way["railway"]({bbox});',
+        'node["railway"]({bbox});',
+    ],
+    "amenities": [
+        'node["amenity"]({bbox});',
+        'way["amenity"]({bbox});',
+    ],
+}
+
+OSM_ALL_CATEGORIES = list(OSM_CATEGORY_QUERIES.keys())
+
+
+def classify_osm_feature(tags):
+    """Classify an OSM element by its tags -> (category, feature_type)."""
+    tags = tags or {}
+    if "highway" in tags:
+        hw = tags["highway"]
+        road_types = {
+            "motorway": "Interstate/Motorway",
+            "trunk": "Primary Arterial",
+            "primary": "Primary Road",
+            "secondary": "Secondary Road",
+            "tertiary": "Tertiary Road",
+            "residential": "Residential Road",
+            "service": "Service Road",
+            "footway": "Footway/Path",
+            "cycleway": "Cycle Path",
+            "path": "Path/Trail",
+            "unclassified": "Unclassified Road",
+        }
+        return "roads", road_types.get(hw, f"Road ({hw})")
+    if "building" in tags:
+        return "buildings", f"Building ({tags.get('building', 'yes')})"
+    if "waterway" in tags:
+        return "waterways", f"Waterway ({tags.get('waterway', 'unknown')})"
+    if "natural" in tags and tags["natural"] in ("water", "wetland", "coastline"):
+        return "waterways", f"Natural water ({tags['natural']})"
+    if "power" in tags:
+        return "utilities", f"Power ({tags.get('power', 'unknown')})"
+    if "man_made" in tags:
+        return "utilities", f"Infrastructure ({tags.get('man_made', 'unknown')})"
+    if "utility" in tags:
+        return "utilities", f"Utility ({tags.get('utility', 'unknown')})"
+    if "landuse" in tags:
+        return "landuse", f"Land use ({tags.get('landuse', 'unknown')})"
+    if "railway" in tags:
+        return "railways", f"Railway ({tags.get('railway', 'unknown')})"
+    if "amenity" in tags:
+        return "amenities", f"Amenity ({tags.get('amenity', 'unknown')})"
+    return "other", "Unknown feature"
+
+
+def _osm_way_geometry(way, node_lookup):
+    """Reconstruct a way's GeoJSON geometry from the node coordinate lookup.
+
+    A way whose first and last node coincide AND which is tagged as an area
+    (building / landuse / natural / amenity area) becomes a GeoJSON Polygon;
+    otherwise it is a LineString.
+    """
+    node_ids = way.get("nodes") or []
+    coords = []
+    for nid in node_ids:
+        pt = node_lookup.get(nid)
+        if pt is not None:
+            coords.append([pt[0], pt[1]])  # [lon, lat]
+    if len(coords) < 2:
+        return None
+
+    tags = way.get("tags") or {}
+    is_closed = len(coords) >= 4 and coords[0] == coords[-1]
+    area_tag = (
+        "building" in tags
+        or "landuse" in tags
+        or tags.get("natural") in ("water", "wetland")
+        or (tags.get("area") == "yes")
+    )
+    if is_closed and area_tag:
+        return {"type": "Polygon", "coordinates": [coords]}
+    return {"type": "LineString", "coordinates": coords}
+
+
+def _build_overpass_query(bbox, categories):
+    """Assemble the full Overpass QL query for the requested categories."""
+    stmts = []
+    for cat in categories:
+        for frag in OSM_CATEGORY_QUERIES.get(cat, []):
+            stmts.append(frag.format(bbox=bbox))
+    body = "\n".join(stmts)
+    return (
+        "[out:json][timeout:25];\n"
+        "(\n" + body + "\n);\n"
+        "out body; >; out skel qt;"
+    )
+
+
+def _overpass_request(query, timeout=40):
+    """POST an Overpass query, trying the primary then fallback endpoint."""
+    import requests
+
+    last_exc = None
+    for url in OVERPASS_ENDPOINTS:
+        try:
+            resp = requests.post(
+                url,
+                data={"data": query},
+                headers={"User-Agent": OSM_USER_AGENT},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:  # transport / HTTP / JSON error
+            last_exc = exc
+            continue
+    raise last_exc if last_exc else RuntimeError("Overpass request failed")
+
+
+def osm_lookup(lat, lon, radius_meters=200, categories=None) -> dict:
+    """Query OSM (Overpass) for infrastructure features near a coordinate."""
+    # ── Validate inputs ──────────────────────────────────────────────
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except (TypeError, ValueError):
+        return _tool_json(
+            {"error": "Both 'lat' and 'lon' are required and must be numbers."},
+            is_error=True,
+        )
+
+    if not (-90.0 <= lat_f <= 90.0) or not (-180.0 <= lon_f <= 180.0):
+        return _tool_json(
+            {
+                "error": (
+                    "Coordinates out of range. lat must be in [-90, 90] and "
+                    "lon in [-180, 180]."
+                ),
+                "location": {"lat": lat_f, "lon": lon_f},
+            },
+            is_error=True,
+        )
+
+    # Radius: default 200 m, capped at 1000 m.
+    try:
+        radius_f = float(radius_meters) if radius_meters is not None else OSM_DEFAULT_RADIUS
+    except (TypeError, ValueError):
+        radius_f = OSM_DEFAULT_RADIUS
+    if radius_f <= 0:
+        radius_f = OSM_DEFAULT_RADIUS
+    radius_f = min(radius_f, OSM_MAX_RADIUS)
+
+    # Categories: default to all; validate against the known set.
+    if categories is None:
+        req_categories = list(OSM_ALL_CATEGORIES)
+    else:
+        if isinstance(categories, str):
+            categories = [categories]
+        req_categories = [
+            str(c).strip().lower()
+            for c in categories
+            if str(c).strip().lower() in OSM_CATEGORY_QUERIES
+        ]
+        if not req_categories:
+            req_categories = list(OSM_ALL_CATEGORIES)
+
+    # ── Bounding box from radius ─────────────────────────────────────
+    dlat = radius_f / 111320.0
+    dlon = radius_f / (111320.0 * max(math.cos(math.radians(lat_f)), 1e-6))
+    # Overpass bbox order is south,west,north,east.
+    bbox = f"{lat_f - dlat},{lon_f - dlon},{lat_f + dlat},{lon_f + dlon}"
+
+    query = _build_overpass_query(bbox, req_categories)
+
+    # ── Query Overpass ───────────────────────────────────────────────
+    try:
+        data = _overpass_request(query)
+    except Exception as exc:
+        return _tool_json(
+            {
+                "error": (
+                    "OpenStreetMap Overpass API is unreachable. Please retry "
+                    "later."
+                ),
+                "detail": str(exc),
+                "location": {"lat": lat_f, "lon": lon_f},
+                "source": "OpenStreetMap contributors",
+                "osm_license": f"ODbL - {OSM_COPYRIGHT_URL}",
+            },
+            is_error=True,
+        )
+
+    elements = (data or {}).get("elements") or []
+
+    # Build node lookup {id: [lon, lat]} for way/relation geometry.
+    node_lookup = {}
+    for el in elements:
+        if el.get("type") == "node" and "lat" in el and "lon" in el:
+            node_lookup[el["id"]] = [el["lon"], el["lat"]]
+
+    # ── Parse elements into features ─────────────────────────────────
+    features = []
+    summary = {c: 0 for c in OSM_ALL_CATEGORIES}
+    summary["total"] = 0
+
+    for el in elements:
+        if len(features) >= OSM_MAX_FEATURES:
+            break
+        etype = el.get("type")
+        tags = el.get("tags") or {}
+        # Skip untagged skeleton nodes used only for geometry.
+        if not tags:
+            continue
+
+        category, feature_type = classify_osm_feature(tags)
+        # Only surface features in the requested categories.
+        if category not in req_categories:
+            continue
+
+        if etype == "node":
+            if "lat" in el and "lon" in el:
+                geometry = {"type": "Point", "coordinates": [el["lon"], el["lat"]]}
+            else:
+                geometry = None
+        elif etype == "way":
+            geometry = _osm_way_geometry(el, node_lookup)
+        else:  # relation -- geometry reconstruction is out of scope; keep metadata
+            geometry = None
+
+        features.append(
+            {
+                "osm_id": el.get("id"),
+                "osm_type": etype,
+                "category": category,
+                "feature_type": feature_type,
+                "name": tags.get("name"),
+                "tags": tags,
+                "geometry": geometry,
+            }
+        )
+        if category in summary:
+            summary[category] += 1
+        summary["total"] += 1
+
+    return _tool_json(
+        {
+            "location": {"lat": lat_f, "lon": lon_f},
+            "radius_meters": radius_f,
+            "categories": req_categories,
+            "feature_summary": summary,
+            "features": features,
+            "source": "OpenStreetMap contributors",
+            "osm_license": f"ODbL - {OSM_COPYRIGHT_URL}",
+        }
+    )
+
+
 def _handle_rpc(message: dict) -> Optional[dict]:
     """Handle a single JSON-RPC message. Returns None for notifications."""
     msg_id = message.get("id")
@@ -1384,6 +1739,16 @@ def _handle_rpc(message: dict) -> Optional[dict]:
                 wetland_lookup(
                     arguments.get("lat"),
                     arguments.get("lon"),
+                ),
+            )
+        if name == "osm_lookup":
+            return _rpc_result(
+                msg_id,
+                osm_lookup(
+                    arguments.get("lat"),
+                    arguments.get("lon"),
+                    arguments.get("radius_meters", 200),
+                    arguments.get("categories"),
                 ),
             )
         return _rpc_error(msg_id, -32602, f"Unknown tool: {name}")
