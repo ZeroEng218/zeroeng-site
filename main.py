@@ -60,145 +60,370 @@ PAGE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Zero Engineering</title>
+    <title>Zero Engineering &mdash; AI-Native Geospatial Intelligence</title>
+    <meta name="description" content="An open MCP server connecting AI agents to authoritative environmental and infrastructure data: soils, flood zones, wetlands, and street maps.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="alternate" type="text/plain" href="/llms.txt" title="For AI agents">
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-        html, body { height: 100%; background: #000; color: #fff; font-family: 'IBM Plex Mono', monospace; -webkit-font-smoothing: antialiased; }
-
-        .stage {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            gap: 2.75rem;
-            padding: 3rem 1.5rem;
+        :root {
+            --bg: #0a0a0a;
+            --bg-soft: #0f0f10;
+            --panel: #121214;
+            --border: #232327;
+            --border-hi: #34343a;
+            --text: #f2f2f4;
+            --muted: #9a9aa2;
+            --faint: #6a6a72;
+            --cyan: #00d4ff;
+            --green: #00ff88;
         }
-
-        /* ── Logo ── */
-        .logo { display: flex; flex-direction: column; align-items: center; gap: 1.5rem; }
-        .logo-mark { width: 80px; height: 80px; }
-        .logo-wordmark { font-size: 1rem; font-weight: 500; letter-spacing: 0.22em; text-transform: uppercase; color: #fff; }
-        .divider { width: 1px; height: 40px; background: #222; }
-        .tagline { font-size: 0.85rem; font-weight: 300; letter-spacing: 0.18em; text-transform: uppercase; color: #fff; text-align: center; }
-        .contact { font-size: 0.8rem; font-weight: 300; letter-spacing: 0.1em; color: #fff; text-align: center; }
-        .contact a { color: #fff; text-decoration: none; border-bottom: 1px solid #555; padding-bottom: 1px; transition: border-color 0.15s; }
-        .contact a:hover { border-color: #fff; }
-
-        /* ── Services ── */
-        .services-label {
-            font-size: 0.6rem;
-            font-weight: 400;
-            letter-spacing: 0.22em;
-            text-transform: uppercase;
-            color: #fff;
+        html { scroll-behavior: smooth; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Inter', system-ui, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            line-height: 1.6;
+            background-image:
+                radial-gradient(circle at 15% 10%, rgba(0,212,255,0.06), transparent 40%),
+                radial-gradient(circle at 85% 0%, rgba(0,255,136,0.04), transparent 35%),
+                linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+            background-size: 100% 100%, 100% 100%, 44px 44px, 44px 44px;
         }
+        code, .mono { font-family: 'IBM Plex Mono', monospace; }
+        a { color: inherit; text-decoration: none; }
+        .wrap { max-width: 1120px; margin: 0 auto; padding: 0 1.5rem; }
+        .accent { color: var(--cyan); }
 
-        .services {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 1rem;
-            justify-content: center;
+        /* Nav */
+        nav {
+            position: sticky; top: 0; z-index: 50;
+            backdrop-filter: blur(12px);
+            background: rgba(10,10,10,0.72);
+            border-bottom: 1px solid var(--border);
         }
+        .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+        .brand { display: flex; align-items: center; gap: 0.7rem; }
+        .brand svg { width: 30px; height: 30px; }
+        .brand-name { font-weight: 600; letter-spacing: 0.16em; font-size: 0.82rem; text-transform: uppercase; }
+        .nav-links { display: flex; align-items: center; gap: 1.75rem; }
+        .nav-links a { font-size: 0.85rem; color: var(--muted); transition: color 0.15s; }
+        .nav-links a:hover { color: var(--text); }
+        .status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.72rem; color: var(--muted); }
+        .status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 0 rgba(0,255,136,0.6); animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(0,255,136,0.5);} 70% { box-shadow: 0 0 0 8px rgba(0,255,136,0);} 100% { box-shadow: 0 0 0 0 rgba(0,255,136,0);} }
+        @media (max-width: 780px){ .nav-links a:not(.nav-cta){ display:none; } }
 
-        .tile {
-            display: flex;
-            flex-direction: column;
-            gap: 0.6rem;
-            padding: 1.5rem 2rem;
-            border: 1px solid #2a2a2a;
-            border-top: 2px solid #fff;
-            background: #080808;
-            min-width: 220px;
-            max-width: 320px;
-            transition: border-color 0.2s, background 0.2s;
-            cursor: default;
-        }
+        /* Hero */
+        .hero { padding: 5.5rem 0 3.5rem; text-align: center; }
+        .eyebrow { display:inline-block; font-family:'IBM Plex Mono',monospace; font-size:0.7rem; letter-spacing:0.24em; text-transform:uppercase; color: var(--cyan); border:1px solid var(--border-hi); border-radius:999px; padding:0.35rem 0.9rem; margin-bottom:1.6rem; }
+        .hero h1 { font-size: clamp(2.1rem, 5.5vw, 3.6rem); font-weight: 700; letter-spacing: -0.02em; line-height: 1.08; background: linear-gradient(180deg, #fff, #b9c6cc); -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .hero p.sub { max-width: 720px; margin: 1.4rem auto 0; color: var(--muted); font-size: clamp(0.98rem, 2vw, 1.14rem); font-weight: 300; }
 
-        .tile:hover {
-            border-color: #444;
-            border-top-color: #fff;
-            background: #0d0d0d;
-        }
+        /* Connection box */
+        .conn { max-width: 760px; margin: 2.6rem auto 0; background: linear-gradient(180deg, var(--panel), var(--bg-soft)); border: 1px solid var(--border-hi); border-radius: 14px; padding: 1.5rem; text-align: left; box-shadow: 0 20px 60px -30px rgba(0,212,255,0.35); }
+        .conn-label { font-size: 0.68rem; letter-spacing: 0.2em; text-transform: uppercase; color: var(--faint); margin-bottom: 0.7rem; display:flex; align-items:center; gap:0.4rem;}
+        .conn-row { display: flex; gap: 0.6rem; align-items: stretch; flex-wrap: wrap; }
+        .conn-url { flex: 1 1 320px; display:flex; align-items:center; font-family: 'IBM Plex Mono', monospace; font-size: 0.98rem; color: var(--text); background: #060606; border: 1px solid var(--border); border-radius: 9px; padding: 0.75rem 0.95rem; overflow-x:auto; }
+        .btn { border: 1px solid var(--border-hi); background: #17171a; color: var(--text); font-family: inherit; font-size: 0.82rem; font-weight: 500; padding: 0.75rem 1.05rem; border-radius: 9px; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
+        .btn:hover { border-color: var(--cyan); color: var(--cyan); }
+        .btn.primary { background: var(--cyan); color: #04121a; border-color: var(--cyan); }
+        .btn.primary:hover { background: #33ddff; color: #04121a; }
+        .conn-meta { margin-top: 1rem; display: flex; flex-wrap: wrap; gap: 0.5rem 1.4rem; font-size: 0.76rem; color: var(--muted); font-family:'IBM Plex Mono',monospace; }
+        .conn-meta b { color: var(--text); font-weight: 500; }
+        .conn-note { margin-top: 0.85rem; font-size: 0.78rem; color: var(--faint); }
 
-        .tile-label {
-            font-size: 0.6rem;
-            font-weight: 400;
-            letter-spacing: 0.2em;
-            text-transform: uppercase;
-            color: #fff;
-        }
+        /* Sections */
+        section { padding: 4rem 0; }
+        .sec-head { text-align: center; margin-bottom: 2.6rem; }
+        .sec-head .kicker { font-family:'IBM Plex Mono',monospace; font-size: 0.72rem; letter-spacing: 0.22em; text-transform: uppercase; color: var(--cyan); }
+        .sec-head h2 { font-size: clamp(1.5rem, 3.5vw, 2.1rem); font-weight: 600; letter-spacing: -0.01em; margin-top: 0.5rem; }
 
-        .tile-name {
-            font-size: 1rem;
-            font-weight: 500;
-            letter-spacing: 0.12em;
-            text-transform: uppercase;
-            color: #fff;
-        }
+        /* Tools grid */
+        .tools { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; }
+        .tool { background: var(--panel); border: 1px solid var(--border); border-radius: 13px; padding: 1.4rem; transition: border-color 0.2s, transform 0.2s; }
+        .tool:hover { border-color: var(--border-hi); transform: translateY(-3px); }
+        .tool-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.9rem; }
+        .tool-ico { font-size: 1.5rem; }
+        .badge { font-family:'IBM Plex Mono',monospace; font-size: 0.62rem; letter-spacing: 0.06em; text-transform: uppercase; padding: 0.28rem 0.6rem; border-radius: 999px; border: 1px solid var(--border-hi); color: var(--muted); }
+        .badge.geo { color: var(--green); border-color: rgba(0,255,136,0.35); }
+        .tool h3 { font-family: 'IBM Plex Mono', monospace; font-size: 1rem; font-weight: 500; color: var(--cyan); margin-bottom: 0.5rem; }
+        .tool p { font-size: 0.86rem; color: var(--muted); font-weight: 300; margin-bottom: 0.9rem; }
+        .params { font-family:'IBM Plex Mono',monospace; font-size: 0.72rem; color: var(--faint); background: #060606; border: 1px solid var(--border); border-radius: 7px; padding: 0.55rem 0.7rem; margin-bottom: 0.9rem; overflow-x:auto; }
+        .params span { color: var(--text); }
+        .src { font-size: 0.72rem; color: var(--faint); }
+        .src b { color: var(--muted); font-weight: 500; }
 
-        .tile-desc {
-            font-size: 0.65rem;
-            font-weight: 300;
-            letter-spacing: 0.05em;
-            color: #fff;
-            line-height: 1.7;
-            margin-top: 0.25rem;
-        }
+        /* Connect columns */
+        .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin-bottom: 1.6rem; }
+        .col { background: var(--panel); border: 1px solid var(--border); border-radius: 13px; padding: 1.4rem; }
+        .col h4 { font-size: 0.95rem; font-weight: 600; margin-bottom: 0.9rem; display:flex; align-items:center; gap:0.5rem; }
+        .col ol { list-style: none; counter-reset: step; }
+        .col ol li { counter-increment: step; position: relative; padding-left: 2rem; margin-bottom: 0.6rem; font-size: 0.84rem; color: var(--muted); font-weight: 300; }
+        .col ol li::before { content: counter(step); position: absolute; left: 0; top: 0; width: 1.35rem; height: 1.35rem; background: #17171a; border: 1px solid var(--border-hi); color: var(--cyan); border-radius: 50%; font-family:'IBM Plex Mono',monospace; font-size: 0.68rem; display:flex; align-items:center; justify-content:center; }
+        .col code { color: var(--text); font-size: 0.8rem; word-break: break-all; }
+        .codeblock { position: relative; background: #060606; border: 1px solid var(--border); border-radius: 11px; padding: 1.1rem 1.2rem; overflow-x: auto; }
+        .codeblock pre { font-family: 'IBM Plex Mono', monospace; font-size: 0.82rem; color: #cdd6db; line-height: 1.7; }
+        .codeblock .k { color: var(--cyan); }
+        .codeblock .s { color: var(--green); }
+        .codeblock .copy { position: absolute; top: 0.7rem; right: 0.7rem; padding: 0.4rem 0.7rem; font-size: 0.72rem; }
 
-        .tile-desc a { color: #fff; }
+        /* Use cases */
+        .cases { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+        .case { background: linear-gradient(180deg, var(--panel), var(--bg-soft)); border: 1px solid var(--border); border-radius: 13px; padding: 1.6rem; }
+        .case .ci { font-size: 1.7rem; margin-bottom: 0.8rem; }
+        .case h4 { font-size: 1.02rem; font-weight: 600; margin-bottom: 0.5rem; }
+        .case p { font-size: 0.86rem; color: var(--muted); font-weight: 300; }
 
-        /* ── Logo animations ── */
-        .bracket-left  { animation: bracket-left-loop  9s cubic-bezier(0.4,0,0.2,1) infinite; transform-origin: 24px 60px; }
-        .bracket-right { animation: bracket-right-loop 9s cubic-bezier(0.4,0,0.2,1) infinite; transform-origin: 96px 60px; }
-        .ring  { stroke-dasharray: 138; animation: ring-loop 9s cubic-bezier(0.4,0,0.2,1) infinite; transform-origin: 60px 60px; }
-        .dot   { animation: dot-loop 9s cubic-bezier(0.34,1.56,0.64,1) infinite; transform-origin: 60px 60px; }
+        /* About */
+        .about { max-width: 760px; margin: 0 auto; text-align: center; }
+        .about p { color: var(--muted); font-size: 1.02rem; font-weight: 300; }
+        .about .stack { margin-top: 1.4rem; font-family:'IBM Plex Mono',monospace; font-size: 0.76rem; color: var(--faint); letter-spacing: 0.05em; }
+        .about .ghbtn { display:inline-block; margin-top: 1.6rem; }
 
-        @keyframes bracket-left-loop  { 0% { transform: translateX(-10px); opacity: 0; } 15%,78% { transform: translateX(0); opacity: 1; } 92%,100% { transform: translateX(-10px); opacity: 0; } }
-        @keyframes bracket-right-loop { 0% { transform: translateX(10px);  opacity: 0; } 15%,78% { transform: translateX(0); opacity: 1; } 92%,100% { transform: translateX(10px);  opacity: 0; } }
-        @keyframes ring-loop { 0%,10% { stroke-dashoffset: 138; } 40%,68% { stroke-dashoffset: 0; } 88%,100% { stroke-dashoffset: 138; } }
-        @keyframes dot-loop  { 0%,35% { transform: scale(0); opacity: 0; } 42% { transform: scale(1.5); opacity: 0.8; } 50%,65% { transform: scale(1); opacity: 1; } 72% { transform: scale(1.4); opacity: 0.6; } 82%,100% { transform: scale(0); opacity: 0; } }
+        /* Footer */
+        footer { border-top: 1px solid var(--border); padding: 2.5rem 0; }
+        .foot-inner { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; justify-content: space-between; }
+        .foot-inner p { font-size: 0.76rem; color: var(--faint); max-width: 560px; }
+        .foot-links { display: flex; gap: 1.3rem; font-size: 0.8rem; }
+        .foot-links a { color: var(--muted); } .foot-links a:hover { color: var(--cyan); }
+
+        /* toast */
+        .toast { position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--green); color: #04120a; font-weight: 600; font-size: 0.85rem; padding: 0.7rem 1.3rem; border-radius: 9px; opacity: 0; pointer-events: none; transition: all 0.25s; z-index: 100; }
+        .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+        /* logo anim */
+        .ring2 { stroke-dasharray: 138; animation: ringloop 9s cubic-bezier(0.4,0,0.2,1) infinite; transform-origin: 60px 60px; }
+        .dot2 { animation: dotloop 9s cubic-bezier(0.34,1.56,0.64,1) infinite; transform-origin: 60px 60px; }
+        @keyframes ringloop { 0%,10% { stroke-dashoffset: 138; } 40%,68% { stroke-dashoffset: 0; } 88%,100% { stroke-dashoffset: 138; } }
+        @keyframes dotloop { 0%,35% { transform: scale(0); opacity: 0; } 50%,65% { transform: scale(1); opacity: 1; } 82%,100% { transform: scale(0); opacity: 0; } }
     </style>
 </head>
 <body>
-<div class="stage">
 
-    <div class="logo">
-        <svg class="logo-mark" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path class="bracket-left"  d="M18 25 L30 25 L30 30 L23 30 L23 90 L30 90 L30 95 L18 95 Z" fill="#444"/>
-            <path class="bracket-right" d="M102 25 L90 25 L90 30 L97 30 L97 90 L90 90 L90 95 L102 95 Z" fill="#444"/>
-            <rect class="ring" x="38" y="38" width="44" height="44" rx="22" ry="22" stroke="#fff" stroke-width="5" fill="none"/>
-            <circle class="dot" cx="60" cy="60" r="5" fill="#fff"/>
-        </svg>
-        <span class="logo-wordmark">Zero Engineering</span>
+<nav>
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top">
+      <svg viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect class="ring2" x="38" y="38" width="44" height="44" rx="22" ry="22" stroke="#00d4ff" stroke-width="6" fill="none"/>
+        <circle class="dot2" cx="60" cy="60" r="6" fill="#fff"/>
+      </svg>
+      <span class="brand-name">Zero Engineering</span>
+    </a>
+    <div class="nav-links">
+      <a href="#tools">Tools</a>
+      <a href="#connect">Connect</a>
+      <a href="#cases">Use Cases</a>
+      <a href="#about">About</a>
+      <a href="https://github.com/ZeroEng218/zeroeng-site" target="_blank" rel="noopener">GitHub</a>
+      <span class="status"><span class="dot"></span>MCP Server Online</span>
+    </div>
+  </div>
+</nav>
+
+<a id="top"></a>
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow">Model Context Protocol &bull; Live</span>
+    <h1>AI-Native Geospatial Intelligence</h1>
+    <p class="sub">An open MCP server connecting AI agents to authoritative environmental and infrastructure data &mdash; soils, flood zones, wetlands, and street maps &mdash; ready for Civil 3D workflows.</p>
+
+    <div class="conn">
+      <div class="conn-label">&#128268; MCP Server URL</div>
+      <div class="conn-row">
+        <div class="conn-url" id="mcpUrl">https://www.zeroeng.io/mcp</div>
+        <button class="btn primary" onclick="copyText('https://www.zeroeng.io/mcp', this)">Copy URL</button>
+        <a class="btn" href="/health" target="_blank" rel="noopener">Test Connection</a>
+      </div>
+      <div class="conn-meta">
+        <span>Transport: <b>Streamable HTTP</b></span>
+        <span>Protocol: <b>JSON-RPC 2.0</b></span>
+        <span>Auth: <b>None required</b></span>
+      </div>
+      <p class="conn-note">Compatible with Abacus AI, Claude Desktop, Cursor, Windsurf, and any MCP client.</p>
+    </div>
+  </div>
+</header>
+
+<section id="tools">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Capabilities</span>
+      <h2>5 Available Tools</h2>
+    </div>
+    <div class="tools">
+
+      <div class="tool">
+        <div class="tool-top"><span class="tool-ico">&#127793;</span><span class="badge geo">Returns GeoJSON</span></div>
+        <h3>soil_lookup</h3>
+        <p>Soil series, drainage class, texture, and hydric rating with polygon boundaries for any US coordinate.</p>
+        <div class="params">{ <span>lat</span>, <span>lon</span>, radius_meters? }</div>
+        <div class="src"><b>Source:</b> USDA SSURGO</div>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="tool-ico">&#127754;</span><span class="badge geo">Returns GeoJSON</span></div>
+        <h3>fema_flood_lookup</h3>
+        <p>FEMA flood zone designation (AE, X, VE&hellip;), base flood elevation, and SFHA status with boundaries.</p>
+        <div class="params">{ <span>lat</span>, <span>lon</span> }</div>
+        <div class="src"><b>Source:</b> FEMA NFHL</div>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="tool-ico">&#127807;</span><span class="badge geo">Returns GeoJSON</span></div>
+        <h3>wetland_lookup</h3>
+        <p>NWI Cowardin classification, acreage, and Section 404 regulatory flags with polygon boundaries.</p>
+        <div class="params">{ <span>lat</span>, <span>lon</span> }</div>
+        <div class="src"><b>Source:</b> USFWS NWI</div>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="tool-ico">&#128506;</span><span class="badge geo">Returns GeoJSON</span></div>
+        <h3>osm_lookup</h3>
+        <p>Roads, buildings, utilities, waterways, and land use features. Filterable by category.</p>
+        <div class="params">{ <span>lat</span>, <span>lon</span>, radius_meters?, categories? }</div>
+        <div class="src"><b>Source:</b> OpenStreetMap</div>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="tool-ico">&#127963;</span><span class="badge">Returns Text</span></div>
+        <h3>state_capital_lookup</h3>
+        <p>Returns the capital city for any US state. Demo tool showcasing Supabase integration.</p>
+        <div class="params">{ <span>state</span> }</div>
+        <div class="src"><b>Source:</b> Zero Engineering DB</div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<section id="connect" style="background:var(--bg-soft); border-top:1px solid var(--border); border-bottom:1px solid var(--border);">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Integration</span>
+      <h2>Connect in 60 Seconds</h2>
+    </div>
+    <div class="cols">
+      <div class="col">
+        <h4>&#129302; Abacus AI</h4>
+        <ol>
+          <li>Open MCP Server Configurations</li>
+          <li>Click Add MCP Server</li>
+          <li>Name: <code>ZeroEng</code></li>
+          <li>URL: <code>https://www.zeroeng.io/mcp</code></li>
+          <li>Transport: Streamable HTTP</li>
+          <li>Save &amp; ask your agent</li>
+        </ol>
+      </div>
+      <div class="col">
+        <h4>&#128421; Claude Desktop</h4>
+        <ol>
+          <li>Edit <code>claude_desktop_config.json</code></li>
+          <li>Add an <code>mcpServers</code> entry with the URL</li>
+          <li>Restart Claude Desktop</li>
+        </ol>
+      </div>
+      <div class="col">
+        <h4>&#9889; Cursor / Windsurf</h4>
+        <ol>
+          <li>Open MCP settings</li>
+          <li>Add server with the URL</li>
+          <li>Transport: HTTP</li>
+        </ol>
+      </div>
     </div>
 
-    <div class="divider"></div>
-
-    <p class="tagline">Agentic Solutions for the Built Environment</p>
-
-    <p class="services-label">Services</p>
-
-    <div class="services">
-        <div class="tile">
-            <span class="tile-label">Offering</span>
-            <span class="tile-name">MCP Server</span>
-            <p class="tile-desc">Custom Model Context Protocol servers that give your AI agents secure, structured access to tools, data, and workflows. Live tools at <a href="/mcp">/mcp</a> (streamable HTTP, JSON-RPC 2.0): <code>state_capital_lookup</code>; <code>soil_lookup</code> — USDA SSURGO soil types &amp; GeoJSON boundaries by lat/lon; <code>fema_flood_lookup</code> — FEMA NFHL flood zones &amp; GeoJSON boundaries by lat/lon; <code>wetland_lookup</code> — USFWS NWI wetland classifications &amp; GeoJSON boundaries by lat/lon; and <code>osm_lookup</code> — OpenStreetMap roads, buildings, utilities, waterways &amp; land use as GeoJSON by lat/lon.</p>
-        </div>
-        <div class="tile">
-            <span class="tile-label">Offering</span>
-            <span class="tile-name">Autodesk Dynamo</span>
-            <p class="tile-desc">Parametric scripting and automation inside Revit and Civil 3D — streamlining repetitive workflows and driving data-informed design.</p>
-        </div>
+    <div class="codeblock">
+      <button class="btn copy" onclick="copyConfig(this)">Copy</button>
+      <pre id="cfg"><span class="k">{</span>
+  <span class="k">"mcpServers"</span>: {
+    <span class="k">"zeroeng"</span>: {
+      <span class="k">"url"</span>: <span class="s">"https://www.zeroeng.io/mcp"</span>,
+      <span class="k">"transport"</span>: <span class="s">"streamable-http"</span>
+    }
+  }
+<span class="k">}</span></pre>
     </div>
+  </div>
+</section>
 
-    <p class="contact">contact &mdash; <a href="mailto:admin@zeroeng.io">admin@zeroeng.io</a></p>
+<section id="cases">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Applications</span>
+      <h2>Built for the Built Environment</h2>
+    </div>
+    <div class="cases">
+      <div class="case">
+        <div class="ci">&#127959;</div>
+        <h4>Civil Engineering</h4>
+        <p>Automated site assessments piped directly into Civil 3D and Autodesk Dynamo as labeled polylines.</p>
+      </div>
+      <div class="case">
+        <div class="ci">&#127807;</div>
+        <h4>Environmental Review</h4>
+        <p>Instant soil, flood, and wetland data for any project location &mdash; no manual portal downloads.</p>
+      </div>
+      <div class="case">
+        <div class="ci">&#129302;</div>
+        <h4>Agentic Workflows</h4>
+        <p>Connect AI agents to authoritative GIS data without building or managing a single API integration.</p>
+      </div>
+    </div>
+  </div>
+</section>
 
-</div>
+<section id="about" style="background:var(--bg-soft); border-top:1px solid var(--border);">
+  <div class="wrap about">
+    <div class="sec-head"><span class="kicker">Mission</span><h2>About Zero Engineering</h2></div>
+    <p>Zero Engineering is an R&amp;D initiative exploring agentic workflows for the built environment &mdash; finding real value in AI-native infrastructure tools that benefit SSOE and the broader AEC industry.</p>
+    <div class="stack">Built with FastAPI &bull; Railway &bull; Supabase</div>
+    <a class="btn ghbtn" href="https://github.com/ZeroEng218/zeroeng-site" target="_blank" rel="noopener">View on GitHub &rarr;</a>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot-inner">
+    <p>&copy; 2025 Zero Engineering. Data provided by USDA, FEMA, USFWS, and OpenStreetMap contributors.</p>
+    <div class="foot-links">
+      <a href="https://github.com/ZeroEng218/zeroeng-site" target="_blank" rel="noopener">GitHub</a>
+      <a href="/llms.txt">llms.txt</a>
+      <a href="/health">Health Check</a>
+    </div>
+  </div>
+</footer>
+
+<div class="toast" id="toast">Copied!</div>
+
+<script>
+  function showToast(msg){
+    var t = document.getElementById('toast');
+    t.textContent = msg || 'Copied!';
+    t.classList.add('show');
+    clearTimeout(window.__tt);
+    window.__tt = setTimeout(function(){ t.classList.remove('show'); }, 1600);
+  }
+  function copyText(text, btn){
+    navigator.clipboard.writeText(text).then(function(){
+      var old = btn.textContent; btn.textContent = 'Copied!';
+      showToast('URL copied to clipboard');
+      setTimeout(function(){ btn.textContent = old; }, 1400);
+    }).catch(function(){ showToast('Copy failed'); });
+  }
+  function copyConfig(btn){
+    var cfg = document.getElementById('cfg').innerText;
+    navigator.clipboard.writeText(cfg).then(function(){
+      var old = btn.textContent; btn.textContent = 'Copied!';
+      showToast('Config copied to clipboard');
+      setTimeout(function(){ btn.textContent = old; }, 1400);
+    }).catch(function(){ showToast('Copy failed'); });
+  }
+</script>
+
 </body>
 </html>
 """
