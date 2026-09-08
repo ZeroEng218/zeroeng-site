@@ -380,7 +380,7 @@ PAGE = """<!DOCTYPE html>
 <section id="about" style="background:var(--bg-soft); border-top:1px solid var(--border);">
   <div class="wrap about">
     <div class="sec-head"><span class="kicker">Mission</span><h2>About Zero Engineering</h2></div>
-    <p>Zero Engineering is an R&amp;D initiative exploring agentic workflows for the built environment &mdash; finding real value in AI-native infrastructure tools that benefit SSOE and the broader AEC industry.</p>
+    <p>Zero Engineering is an R&amp;D initiative exploring agentic workflows for the built environment &mdash; finding real value in AI-native infrastructure tools that benefit the AEC industry.</p>
     <div class="stack">Built with FastAPI &bull; Railway &bull; Supabase</div>
     <a class="btn ghbtn" href="https://github.com/ZeroEng218/zeroeng-site" target="_blank" rel="noopener">View on GitHub &rarr;</a>
   </div>
