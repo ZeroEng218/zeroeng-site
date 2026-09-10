@@ -2556,8 +2556,8 @@ async def build_guild_register(request: Request):
             existing = (
                 client.table("guild_members")
                 .select("id")
-                .ilike("org_name", _escape_like(org_name))
-                .ilike("contact_email", _escape_like(contact_email))
+                .eq("org_name",, org_name.strip())
+                .eq("contact_email",, contact_email.lower().strip())
                 .limit(1)
                 .execute()
             )
@@ -2603,7 +2603,7 @@ async def build_guild_register(request: Request):
                     "org_name": org_name,
                     "role": role,
                     "contact_name": contact_name,
-                    "contact_email": contact_email,
+                    "contact_email": contact_email.lower().strip(),
                     "tier": "free",
                     "status": "active",
                     "project_credential": project_credential,
