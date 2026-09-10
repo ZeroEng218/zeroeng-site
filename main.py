@@ -13,10 +13,14 @@ Run locally:
     uvicorn main:app --reload
 """
 
+import datetime
 import json
+import logging
 import math
 import os
 from typing import Any, Optional
+
+from jose import jwt
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -2083,14 +2087,33 @@ AGENT_MANIFEST = {
     },
     "authentication": {
         "status": "unauthenticated",
-        "message": "You have arrived without credentials. This is expected for first-time agents. Read this manifest to understand what the Build Guild offers and how to establish an account.",
+        "message": "You have arrived without credentials. Registration is agent-callable — your agent can complete signup within your LLM session. See how_to_register for the endpoint and required fields.",
         "required_for": "All marketplace transactions, project affiliation, and agent-to-agent messaging require a verified Build Guild account.",
         "how_to_register": {
-            "step_1": "Visit https://www.zeroeng.io/build-guild and complete the human-in-the-loop registration form to create an organization account.",
-            "step_2": "Your human operator will receive a confirmation email and activate the account.",
-            "step_3": "Once activated, you will receive a project_credential (JWT) scoped to your organization and any projects you are affiliated with.",
-            "step_4": "Present your project_credential in the Authorization header on all subsequent requests: Authorization: Bearer <project_credential>",
-            "contact": "For automated onboarding or enterprise registration, contact guild@zeroeng.io"
+            "method": "agent-callable",
+            "description": "Registration is fully completable within your LLM session — no browser required. Your agent calls POST /build-guild/register with a JSON body.",
+            "endpoint": "POST https://www.zeroeng.io/build-guild/register",
+            "content_type": "application/json",
+            "request_body": {
+                "org_name": "Your organization name (string, required)",
+                "role": "One of: Architect, Engineer, Contractor, Vendor, Owner (required)",
+                "contact_name": "Your full name (string, required)",
+                "contact_email": "Your email address (string, required)"
+            },
+            "tiers": {
+                "free": {
+                    "price": "$0",
+                    "includes": [
+                        "Verified org profile in the Build Guild marketplace",
+                        "Access to all public MCP geospatial tools",
+                        "Receive RFPs addressed to your organization",
+                        "project_credential JWT valid for 365 days"
+                    ]
+                }
+            },
+            "on_success": "You will receive a project_credential (JWT). Present it as: Authorization: Bearer <project_credential> on all authenticated Build Guild requests.",
+            "human_in_the_loop": "Before calling this endpoint, confirm the registration details with your human operator. This is the recommended human approval checkpoint.",
+            "contact": "guild@zeroeng.io"
         }
     },
     "capabilities": {
@@ -2410,3 +2433,188 @@ async def well_known_agent_manifest():
 @app.get("/build-guild", response_class=HTMLResponse)
 async def build_guild():
     return BUILD_GUILD_PAGE
+
+
+
+# ---------------------------------------------------------------------------
+# Build Guild registration -- agent-callable, issues a signed JWT credential
+# ---------------------------------------------------------------------------
+
+_guild_logger = logging.getLogger("build_guild")
+
+VALID_GUILD_ROLES = {"Architect", "Engineer", "Contractor", "Vendor", "Owner"}
+
+_JWT_FALLBACK_SECRET = "build-guild-dev-secret-change-in-production"
+
+
+def _guild_jwt_secret() -> str:
+    """Return the JWT signing secret, warning if the env var is not set."""
+    secret = os.environ.get("GUILD_JWT_SECRET")
+    if not secret:
+        _guild_logger.warning(
+            "GUILD_JWT_SECRET is not set; using insecure development fallback. "
+            "Set GUILD_JWT_SECRET in the environment for production."
+        )
+        return _JWT_FALLBACK_SECRET
+    return secret
+
+
+@app.post("/build-guild/register", status_code=201)
+async def build_guild_register(request: Request):
+    """Agent-callable registration for the Build Guild.
+
+    Accepts a JSON body, records the member in Supabase, signs a 365-day JWT
+    credential, and returns it. Fully completable from within an LLM session.
+    """
+    # --- Parse body ---
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_json",
+                "message": "Request body must be valid JSON.",
+            },
+        )
+
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_body",
+                "message": "Request body must be a JSON object.",
+            },
+        )
+
+    org_name = (body.get("org_name") or "").strip() if isinstance(body.get("org_name"), str) else body.get("org_name")
+    role = (body.get("role") or "").strip() if isinstance(body.get("role"), str) else body.get("role")
+    contact_name = (body.get("contact_name") or "").strip() if isinstance(body.get("contact_name"), str) else body.get("contact_name")
+    contact_email = (body.get("contact_email") or "").strip() if isinstance(body.get("contact_email"), str) else body.get("contact_email")
+
+    # --- Validate required fields ---
+    missing = [
+        field
+        for field, value in (
+            ("org_name", org_name),
+            ("role", role),
+            ("contact_name", contact_name),
+            ("contact_email", contact_email),
+        )
+        if not value
+    ]
+    if missing:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "missing_fields",
+                "message": (
+                    "Missing required field(s): "
+                    + ", ".join(missing)
+                    + ". All of org_name, role, contact_name, contact_email are required."
+                ),
+            },
+        )
+
+    # --- Validate role ---
+    if role not in VALID_GUILD_ROLES:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_role",
+                "message": (
+                    f"Invalid role '{role}'. Must be one of: "
+                    + ", ".join(sorted(VALID_GUILD_ROLES))
+                    + "."
+                ),
+            },
+        )
+
+    # --- Duplicate check (best-effort; skip gracefully if Supabase down) ---
+    client = get_supabase()
+    if client is not None:
+        try:
+            existing = (
+                client.table("guild_members")
+                .select("id")
+                .ilike("org_name", org_name)
+                .ilike("contact_email", contact_email)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "already_registered",
+                        "message": "This org/email combination is already registered.",
+                        "credential_note": "Contact guild@zeroeng.io to retrieve your existing credential.",
+                    },
+                )
+        except Exception as exc:
+            # Table may not exist yet, or a transient error -- don't block signup.
+            _guild_logger.warning("Guild duplicate check failed: %s", exc)
+
+    # --- Sign the JWT credential ---
+    now = datetime.datetime.now(datetime.timezone.utc)
+    exp = now + datetime.timedelta(days=365)
+    payload = {
+        "sub": contact_email,
+        "org": org_name,
+        "role": role,
+        "tier": "free",
+        "iss": "build-guild.zeroeng.io",
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+    }
+    project_credential = jwt.encode(payload, _guild_jwt_secret(), algorithm="HS256")
+
+    # --- Persist to Supabase (best-effort) ---
+    if client is not None:
+        try:
+            client.table("guild_members").insert(
+                {
+                    "org_name": org_name,
+                    "role": role,
+                    "contact_name": contact_name,
+                    "contact_email": contact_email,
+                    "tier": "free",
+                    "status": "active",
+                    "project_credential": project_credential,
+                    "created_at": now.isoformat(),
+                }
+            ).execute()
+        except Exception as exc:
+            # Table may not exist yet -- still return the credential so the
+            # endpoint is testable before the table is provisioned.
+            _guild_logger.error("Guild member insert failed: %s", exc)
+    else:
+        _guild_logger.warning(
+            "Supabase not configured; guild member for %s not persisted.",
+            contact_email,
+        )
+
+    # --- Success ---
+    return JSONResponse(
+        status_code=201,
+        content={
+            "status": "registered",
+            "org_name": org_name,
+            "role": role,
+            "tier": "free",
+            "project_credential": project_credential,
+            "instructions": {
+                "how_to_use": "Include this credential in the Authorization header of all Build Guild requests.",
+                "header_format": "Authorization: Bearer <project_credential>",
+                "mcp_endpoint": "https://www.zeroeng.io/mcp",
+                "marketplace": "https://www.zeroeng.io/build-guild",
+                "support": "guild@zeroeng.io",
+            },
+            "capabilities": [
+                "Verified vendor profile in the Build Guild marketplace",
+                "Access to public MCP geospatial tools (soils, flood zones, wetlands, OSM)",
+                "Receive RFPs addressed to your organization",
+                "Participate in project-scoped marketplace activity when invited",
+            ],
+        },
+    )
