@@ -2542,13 +2542,6 @@ async def build_guild_register(request: Request):
     # NOTE: PostgREST `ilike` treats `%`, `_` and `\` as LIKE wildcards, so we
     # escape them to force an exact (case-insensitive) comparison and avoid
     # both false positives (wrong 409) and false negatives (missed duplicate).
-    def _escape_like(value: str) -> str:
-        return (
-            value.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
-
     client = get_supabase()
     if client is not None:
         duplicate_found = False
@@ -2556,8 +2549,8 @@ async def build_guild_register(request: Request):
             existing = (
                 client.table("guild_members")
                 .select("id")
-                .eq("org_name",, org_name.strip())
-                .eq("contact_email",, contact_email.lower().strip())
+                .eq("contact_email", contact_email.lower().strip())
+                .eq("org_name", org_name.strip())
                 .limit(1)
                 .execute()
             )
@@ -2600,9 +2593,9 @@ async def build_guild_register(request: Request):
         try:
             client.table("guild_members").insert(
                 {
-                    "org_name": org_name,
+                    "org_name": org_name.strip(),
                     "role": role,
-                    "contact_name": contact_name,
+                    "contact_name": contact_name.strip(),
                     "contact_email": contact_email.lower().strip(),
                     "tier": "free",
                     "status": "active",
