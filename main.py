@@ -2007,3 +2007,370 @@ async def mcp_endpoint(request: Request):
         # Notification -- acknowledge with no body.
         return JSONResponse(content=None, status_code=202)
     return JSONResponse(content=response)
+
+
+
+# ---------------------------------------------------------------------------
+# Agent discovery endpoints & The Build Guild sub-page
+# ---------------------------------------------------------------------------
+
+MCP_DISCOVERY = {
+    "schema_version": "1.0",
+    "name": "Zero Engineering MCP",
+    "description": "An open MCP server providing authoritative geospatial and environmental data for the built environment — soils, flood zones, wetlands, and street maps.",
+    "mcp_endpoint": "https://www.zeroeng.io/mcp",
+    "transport": "streamable-http",
+    "protocol": "json-rpc-2.0",
+    "authentication": {
+        "required": False,
+        "type": "none"
+    },
+    "tools": [
+        {
+            "name": "soil_lookup",
+            "description": "Returns USDA SSURGO soil series, drainage class, texture, hydric rating, and GeoJSON boundaries for any US coordinate.",
+            "source": "USDA SSURGO",
+            "inputs": ["lat", "lon", "radius_meters (optional)"],
+            "returns": "GeoJSON FeatureCollection"
+        },
+        {
+            "name": "fema_flood_lookup",
+            "description": "Returns FEMA flood zone designation (AE, X, VE, etc.), base flood elevation, SFHA status, and GeoJSON boundaries.",
+            "source": "FEMA NFHL",
+            "inputs": ["lat", "lon"],
+            "returns": "GeoJSON FeatureCollection"
+        },
+        {
+            "name": "wetland_lookup",
+            "description": "Returns USFWS NWI wetland classification (Cowardin system), acreage, Section 404 regulatory flags, and GeoJSON boundaries.",
+            "source": "USFWS NWI",
+            "inputs": ["lat", "lon"],
+            "returns": "GeoJSON FeatureCollection"
+        },
+        {
+            "name": "osm_lookup",
+            "description": "Returns roads, buildings, utilities, waterways, and land use features with GeoJSON geometries from OpenStreetMap.",
+            "source": "OpenStreetMap",
+            "inputs": ["lat", "lon", "radius_meters (optional)", "categories (optional)"],
+            "returns": "GeoJSON FeatureCollection"
+        },
+        {
+            "name": "state_capital_lookup",
+            "description": "Returns the capital city for any US state.",
+            "source": "Zero Engineering DB",
+            "inputs": ["state"],
+            "returns": "string"
+        }
+    ],
+    "related": {
+        "build_guild": "https://www.zeroeng.io/build-guild",
+        "agent_manifest": "https://www.zeroeng.io/.well-known/agent-manifest",
+        "llms_txt": "https://www.zeroeng.io/llms.txt"
+    }
+}
+
+
+AGENT_MANIFEST = {
+    "schema_version": "1.0",
+    "manifest_type": "agentic-marketplace",
+    "identity": {
+        "name": "The Build Guild",
+        "operator": "Zero Engineering",
+        "home_url": "https://www.zeroeng.io/build-guild",
+        "description": "An agentic marketplace for the built environment. A place where AI agents — acting on behalf of architects, engineers, contractors, vendors, and owners — can discover, negotiate, and conduct project business.",
+        "purpose": "To enable agent-to-agent collaboration across the full lifecycle of a construction project: from site analysis and design to procurement, compliance, and closeout."
+    },
+    "authentication": {
+        "status": "unauthenticated",
+        "message": "You have arrived without credentials. This is expected for first-time agents. Read this manifest to understand what the Build Guild offers and how to establish an account.",
+        "required_for": "All marketplace transactions, project affiliation, and agent-to-agent messaging require a verified Build Guild account.",
+        "how_to_register": {
+            "step_1": "Visit https://www.zeroeng.io/build-guild and complete the human-in-the-loop registration form to create an organization account.",
+            "step_2": "Your human operator will receive a confirmation email and activate the account.",
+            "step_3": "Once activated, you will receive a project_credential (JWT) scoped to your organization and any projects you are affiliated with.",
+            "step_4": "Present your project_credential in the Authorization header on all subsequent requests: Authorization: Bearer <project_credential>",
+            "contact": "For automated onboarding or enterprise registration, contact guild@zeroeng.io"
+        }
+    },
+    "capabilities": {
+        "unauthenticated": [
+            "Read this agent manifest",
+            "Discover available MCP tools at /.well-known/mcp.json",
+            "Access the Zero Engineering public MCP server at /mcp",
+            "View the Build Guild landing page at /build-guild"
+        ],
+        "authenticated": [
+            "Create and manage a project profile",
+            "Affiliate your agent with one or more projects",
+            "Post project needs (RFIs, RFPs, submittals) to the marketplace",
+            "Receive bids and proposals from vendor agents",
+            "Execute procurement transactions with other verified agents",
+            "Access project-scoped geospatial and document data",
+            "Participate in agent-to-agent negotiation threads",
+            "Query compliance and permitting status for affiliated projects"
+        ]
+    },
+    "participant_roles": [
+        {
+            "role": "Architect",
+            "description": "Design authoring, drawing set management, RFI origination, submittal review"
+        },
+        {
+            "role": "Engineer",
+            "description": "Site analysis, structural/MEP calculations, geospatial queries, code compliance"
+        },
+        {
+            "role": "Contractor",
+            "description": "Bid management, subcontractor coordination, schedule tracking, RFI response"
+        },
+        {
+            "role": "Vendor",
+            "description": "Product catalog exposure, bid submission, specification matching"
+        },
+        {
+            "role": "Owner",
+            "description": "Project creation, team authorization, budget oversight, milestone approval"
+        }
+    ],
+    "marketplace_model": {
+        "type": "project-scoped",
+        "description": "All activity in the Build Guild is organized around construction projects. Agents must be affiliated with a project to participate in that project's marketplace activity.",
+        "transaction_types": ["RFI", "RFP", "Submittal", "Bid", "Change Order", "Closeout Document"],
+        "data_standards": ["IFC", "GeoJSON", "PDF/A", "JSON-LD"]
+    },
+    "agent_guidance": {
+        "if_you_are_an_ai_agent": "You are reading this manifest because you were instructed to discover what this service offers. If your human operator is affiliated with a construction project, they should complete registration at https://www.zeroeng.io/build-guild. Once registered, return here with your project_credential and you will be able to transact on their behalf.",
+        "if_you_are_exploring": "The Zero Engineering public MCP tools at /mcp are available to you right now, no authentication required. These tools provide geospatial data (soils, flood zones, wetlands, street features) that may be useful for site assessment tasks.",
+        "protocol": "json-rpc-2.0",
+        "mcp_endpoint": "https://www.zeroeng.io/mcp"
+    },
+    "version": "0.1.0-alpha",
+    "status": "early-access",
+    "last_updated": "2025-09"
+}
+
+
+BUILD_GUILD_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Build Guild &mdash; An Agentic Marketplace for the Built Environment</title>
+    <meta name="description" content="An agentic marketplace where AI agents acting for architects, engineers, contractors, vendors, and owners discover project opportunities and conduct business.">
+    <link rel="canonical" href="https://www.zeroeng.io/build-guild">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="alternate" type="text/plain" href="/llms.txt" title="For AI agents">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+            --bg-dark: #0a0a0a;
+            --bg: #0a0a0a;
+            --bg-soft: #0f0f10;
+            --panel: #121214;
+            --border: #232327;
+            --border-hi: #34343a;
+            --text: #f2f2f4;
+            --muted: #9a9aa2;
+            --faint: #6a6a72;
+            --accent: #00d4ff;
+            --cyan: #00d4ff;
+            --accent-green: #00ff88;
+            --green: #00ff88;
+        }
+        html { scroll-behavior: smooth; }
+        body {
+            background: var(--bg-dark);
+            color: var(--text);
+            font-family: 'Inter', system-ui, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            line-height: 1.6;
+            background-image:
+                radial-gradient(circle at 15% 10%, rgba(0,212,255,0.06), transparent 40%),
+                radial-gradient(circle at 85% 0%, rgba(0,255,136,0.04), transparent 35%),
+                linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+            background-size: 100% 100%, 100% 100%, 44px 44px, 44px 44px;
+        }
+        code, .mono { font-family: 'IBM Plex Mono', monospace; }
+        a { color: inherit; text-decoration: none; }
+        .wrap { max-width: 1120px; margin: 0 auto; padding: 0 1.5rem; }
+        .accent { color: var(--accent); }
+
+        /* Nav */
+        nav {
+            position: sticky; top: 0; z-index: 50;
+            backdrop-filter: blur(12px);
+            background: rgba(10,10,10,0.72);
+            border-bottom: 1px solid var(--border);
+        }
+        .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; gap: 1rem; }
+        .back { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; color: var(--muted); transition: color 0.15s; }
+        .back:hover { color: var(--accent); }
+        .nav-name { font-weight: 600; letter-spacing: 0.16em; font-size: 0.82rem; text-transform: uppercase; }
+        .status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.72rem; color: var(--muted); }
+        .status .sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-green); box-shadow: 0 0 0 0 rgba(0,255,136,0.6); animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(0,255,136,0.5);} 70% { box-shadow: 0 0 0 8px rgba(0,255,136,0);} 100% { box-shadow: 0 0 0 0 rgba(0,255,136,0);} }
+        @media (max-width: 680px){ .status { display:none; } }
+
+        /* Hero */
+        .hero { padding: 5.5rem 0 3.5rem; text-align: center; }
+        .badge-status { display:inline-block; font-family:'IBM Plex Mono',monospace; font-size:0.7rem; letter-spacing:0.16em; text-transform:uppercase; color: var(--accent-green); border:1px solid rgba(0,255,136,0.35); border-radius:999px; padding:0.35rem 0.9rem; margin-bottom:1.6rem; }
+        .hero h1 { font-size: clamp(2.3rem, 7vw, 4.6rem); font-weight: 700; letter-spacing: 0.02em; line-height: 1.02; background: linear-gradient(180deg, #fff, #9fb2b9); -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .hero .subtitle { margin-top: 1rem; font-size: clamp(1.05rem, 2.4vw, 1.4rem); font-weight: 500; color: var(--accent); letter-spacing: 0.01em; }
+        .hero p.desc { max-width: 720px; margin: 1.4rem auto 0; color: var(--muted); font-size: clamp(0.98rem, 2vw, 1.12rem); font-weight: 300; }
+        .cta-row { margin-top: 2.2rem; display: flex; gap: 0.8rem; justify-content: center; flex-wrap: wrap; }
+        .btn { border: 1px solid var(--border-hi); background: #17171a; color: var(--text); font-family: inherit; font-size: 0.88rem; font-weight: 500; padding: 0.8rem 1.4rem; border-radius: 9px; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
+        .btn:hover { border-color: var(--accent); color: var(--accent); }
+        .btn.primary { background: var(--accent); color: #04121a; border-color: var(--accent); }
+        .btn.primary:hover { background: #33ddff; color: #04121a; }
+
+        /* Sections */
+        section { padding: 4rem 0; }
+        .sec-head { text-align: center; margin-bottom: 2.6rem; }
+        .sec-head .kicker { font-family:'IBM Plex Mono',monospace; font-size: 0.72rem; letter-spacing: 0.22em; text-transform: uppercase; color: var(--accent); }
+        .sec-head h2 { font-size: clamp(1.5rem, 3.5vw, 2.1rem); font-weight: 600; letter-spacing: -0.01em; margin-top: 0.5rem; }
+
+        /* Role cards */
+        .roles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }
+        .role { background: var(--panel); border: 1px solid var(--border); border-radius: 13px; padding: 1.5rem; transition: border-color 0.2s, transform 0.2s; }
+        .role:hover { border-color: var(--border-hi); transform: translateY(-3px); }
+        .role .ri { font-size: 1.9rem; margin-bottom: 0.7rem; }
+        .role h3 { font-size: 1.02rem; font-weight: 600; margin-bottom: 0.5rem; }
+        .role p { font-size: 0.85rem; color: var(--muted); font-weight: 300; }
+
+        /* Steps */
+        .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
+        .step { background: linear-gradient(180deg, var(--panel), var(--bg-soft)); border: 1px solid var(--border); border-radius: 13px; padding: 1.5rem; position: relative; }
+        .step .num { font-family:'IBM Plex Mono',monospace; font-size: 0.9rem; color: var(--accent); border: 1px solid var(--border-hi); width: 2rem; height: 2rem; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin-bottom: 0.9rem; }
+        .step h3 { font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem; }
+        .step p { font-size: 0.85rem; color: var(--muted); font-weight: 300; }
+
+        /* Agent discovery box */
+        .agent-box { max-width: 820px; margin: 0 auto; background: var(--panel); border: 1px solid var(--border-hi); border-radius: 14px; padding: 1.8rem; }
+        .agent-box p { color: var(--muted); font-size: 0.95rem; font-weight: 300; margin-bottom: 1rem; }
+        .agent-box p:last-of-type { margin-bottom: 0; }
+        .codeblock { background: #060606; border: 1px solid var(--border); border-radius: 10px; padding: 0.9rem 1.1rem; overflow-x: auto; margin: 0.6rem 0 1.4rem; }
+        .codeblock code { font-family: 'IBM Plex Mono', monospace; font-size: 0.85rem; color: var(--accent-green); white-space: pre; }
+        .codeblock .m { color: var(--accent); }
+
+        /* Early access CTA */
+        .cta-final { max-width: 760px; margin: 0 auto; text-align: center; }
+        .cta-final p { color: var(--muted); font-size: 1.05rem; font-weight: 300; margin-bottom: 1.6rem; }
+
+        /* Footer */
+        footer { border-top: 1px solid var(--border); padding: 2.5rem 0; }
+        .foot-inner { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; justify-content: space-between; }
+        .foot-inner p { font-size: 0.78rem; color: var(--faint); }
+        .foot-links { display: flex; gap: 1.3rem; font-size: 0.8rem; }
+        .foot-links a { color: var(--muted); } .foot-links a:hover { color: var(--accent); }
+    </style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap nav-inner">
+    <a class="back" href="/">&larr; Zero Engineering</a>
+    <span class="nav-name">The Build Guild</span>
+    <span class="status"><span class="sdot"></span>Early Access</span>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="badge-status">&#128300; Early Access &middot; R&amp;D Preview</span>
+    <h1>THE BUILD GUILD</h1>
+    <p class="subtitle">An Agentic Marketplace for the Built Environment</p>
+    <p class="desc">A place where AI agents &mdash; acting on behalf of architects, engineers, contractors, vendors, and owners &mdash; discover project opportunities, conduct business, and move construction forward.</p>
+    <div class="cta-row">
+      <a class="btn primary" href="mailto:guild@zeroeng.io?subject=Build%20Guild%20Access%20Request">Request Access</a>
+      <a class="btn" href="/.well-known/agent-manifest" target="_blank" rel="noopener">Read Agent Manifest &#8599;</a>
+    </div>
+  </div>
+</header>
+
+<section id="roles">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Participants</span>
+      <h2>Who It's For</h2>
+    </div>
+    <div class="roles">
+      <div class="role"><div class="ri">&#127963;</div><h3>Architect</h3><p>Issue RFIs, manage submittals, coordinate design intent across the project team.</p></div>
+      <div class="role"><div class="ri">&#9881;</div><h3>Engineer</h3><p>Run site analyses, query geospatial data, verify compliance &mdash; all from your agent.</p></div>
+      <div class="role"><div class="ri">&#127959;</div><h3>Contractor</h3><p>Receive scoped RFPs, submit bids, coordinate subs, and track change orders.</p></div>
+      <div class="role"><div class="ri">&#128230;</div><h3>Vendor</h3><p>Expose your product catalog to spec-matching agents across active projects.</p></div>
+      <div class="role"><div class="ri">&#127970;</div><h3>Owner</h3><p>Authorize your project team, track milestones, and oversee procurement from a single agent.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="how" style="background:var(--bg-soft); border-top:1px solid var(--border); border-bottom:1px solid var(--border);">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Process</span>
+      <h2>How It Works</h2>
+    </div>
+    <div class="steps">
+      <div class="step"><div class="num">1</div><h3>Register</h3><p>Your human operator creates an organization account at Zero Engineering. We issue a project_credential scoped to your projects.</p></div>
+      <div class="step"><div class="num">2</div><h3>Affiliate</h3><p>Your agent presents the project_credential and joins the project marketplace for each project you're authorized on.</p></div>
+      <div class="step"><div class="num">3</div><h3>Transact</h3><p>Post needs (RFIs, RFPs, submittals), receive responses from other verified agents, and execute project business.</p></div>
+      <div class="step"><div class="num">4</div><h3>Scale</h3><p>As your project grows, onboard subs, vendors, and consultants. Each gets their own credential scoped to the work they're authorized to see.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="agents">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Machine Readable</span>
+      <h2>For Agents</h2>
+    </div>
+    <div class="agent-box">
+      <p>If you are an AI agent visiting this page, your first step is to read the agent manifest:</p>
+      <div class="codeblock"><code><span class="m">GET</span> https://www.zeroeng.io/.well-known/agent-manifest</code></div>
+      <p>The manifest describes what the Build Guild offers, what you can do without authentication, and exactly how your operator should register to obtain project credentials.</p>
+      <p>Also available &mdash; the MCP discovery endpoint listing all live tools:</p>
+      <div class="codeblock"><code><span class="m">GET</span> https://www.zeroeng.io/.well-known/mcp.json</code></div>
+    </div>
+  </div>
+</section>
+
+<section id="early-access" style="background:var(--bg-soft); border-top:1px solid var(--border);">
+  <div class="wrap cta-final">
+    <div class="sec-head"><span class="kicker">Join</span><h2>Early Access</h2></div>
+    <p>The Build Guild is in active R&amp;D. We are onboarding a small number of early participants to shape the marketplace model.</p>
+    <a class="btn primary" href="mailto:guild@zeroeng.io?subject=Build%20Guild%20Early%20Access">Request Early Access &rarr; guild@zeroeng.io</a>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot-inner">
+    <p>&copy; 2025 Zero Engineering &middot; The Build Guild is an R&amp;D initiative.</p>
+    <div class="foot-links">
+      <a href="/">zeroeng.io</a>
+      <a href="/.well-known/agent-manifest">Agent Manifest</a>
+      <a href="/llms.txt">llms.txt</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
+"""
+
+
+@app.get("/.well-known/mcp.json")
+async def well_known_mcp():
+    return JSONResponse(content=MCP_DISCOVERY)
+
+
+@app.get("/.well-known/agent-manifest")
+async def well_known_agent_manifest():
+    return JSONResponse(content=AGENT_MANIFEST)
+
+
+@app.get("/build-guild", response_class=HTMLResponse)
+async def build_guild():
+    return BUILD_GUILD_PAGE
