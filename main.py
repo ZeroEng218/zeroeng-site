@@ -2530,30 +2530,56 @@ async def build_guild_register(request: Request):
             },
         )
 
-    # --- Duplicate check (best-effort; skip gracefully if Supabase down) ---
+    # --- Duplicate check ---------------------------------------------------
+    # Query guild_members for a record matching BOTH org_name AND
+    # contact_email (case-insensitive). If a match exists -> HTTP 409.
+    #
+    # The check is best-effort: if the guild_members table does not exist yet
+    # (or any other Supabase error occurs on the select), we log it and fall
+    # through to issue the credential -- an unprovisioned table must not block
+    # signup. Only a *successful* select that returns a matching row blocks it.
+    #
+    # NOTE: PostgREST `ilike` treats `%`, `_` and `\` as LIKE wildcards, so we
+    # escape them to force an exact (case-insensitive) comparison and avoid
+    # both false positives (wrong 409) and false negatives (missed duplicate).
+    def _escape_like(value: str) -> str:
+        return (
+            value.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+
     client = get_supabase()
     if client is not None:
+        duplicate_found = False
         try:
             existing = (
                 client.table("guild_members")
                 .select("id")
-                .ilike("org_name", org_name)
-                .ilike("contact_email", contact_email)
+                .ilike("org_name", _escape_like(org_name))
+                .ilike("contact_email", _escape_like(contact_email))
                 .limit(1)
                 .execute()
             )
-            if existing.data:
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "error": "already_registered",
-                        "message": "This org/email combination is already registered.",
-                        "credential_note": "Contact guild@zeroeng.io to retrieve your existing credential.",
-                    },
-                )
+            # A clean select succeeded -- trust its result.
+            duplicate_found = bool(getattr(existing, "data", None))
         except Exception as exc:
-            # Table may not exist yet, or a transient error -- don't block signup.
-            _guild_logger.warning("Guild duplicate check failed: %s", exc)
+            # Table not provisioned yet, RLS/permission issue, or transient
+            # error. Skip the duplicate check and proceed (acceptable for now).
+            _guild_logger.warning(
+                "Guild duplicate check skipped (select failed): %s", exc
+            )
+            duplicate_found = False
+
+        if duplicate_found:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "already_registered",
+                    "message": "This org/email combination is already registered.",
+                    "credential_note": "Contact guild@zeroeng.io to retrieve your existing credential.",
+                },
+            )
 
     # --- Sign the JWT credential ---
     now = datetime.datetime.now(datetime.timezone.utc)
