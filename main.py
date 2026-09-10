@@ -219,6 +219,7 @@ PAGE = """<!DOCTYPE html>
       <a href="#connect">Connect</a>
       <a href="#cases">Use Cases</a>
       <a href="#about">About</a>
+      <a href="/build-guild" style="color:#f0a500;font-weight:600;">Build Guild</a>
       <a href="https://github.com/ZeroEng218/zeroeng-site" target="_blank" rel="noopener">GitHub</a>
       <span class="status"><span class="dot"></span>MCP Server Online</span>
     </div>
