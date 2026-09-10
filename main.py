@@ -687,6 +687,45 @@ TOOLS = [
             "required": ["lat", "lon"],
         },
     },
+    {
+        "name": "build_guild_register",
+        "description": (
+            "Register an organization with The Build Guild agentic marketplace. "
+            "The Build Guild is a project-scoped marketplace for the built environment — "
+            "connecting AI agents acting on behalf of architects, engineers, contractors, "
+            "vendors, and owners. "
+            "Registration is free (Tier: free, $0). "
+            "On success, returns a project_credential JWT valid for 365 days. "
+            "Present this credential as: Authorization: Bearer <project_credential> "
+            "on all authenticated Build Guild requests. "
+            "IMPORTANT: Before calling this tool, confirm the registration details "
+            "(org_name, role, contact_name, contact_email) with your human operator. "
+            "This confirmation is the recommended human-in-the-loop checkpoint."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "org_name": {
+                    "type": "string",
+                    "description": "The name of the organization to register (e.g. 'SSOE Group')",
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["Architect", "Engineer", "Contractor", "Vendor", "Owner"],
+                    "description": "The organization's primary role in the AEC industry",
+                },
+                "contact_name": {
+                    "type": "string",
+                    "description": "Full name of the primary contact person",
+                },
+                "contact_email": {
+                    "type": "string",
+                    "description": "Email address of the primary contact person",
+                },
+            },
+            "required": ["org_name", "role", "contact_name", "contact_email"],
+        },
+    },
 ]
 
 
@@ -1981,6 +2020,16 @@ def _handle_rpc(message: dict) -> Optional[dict]:
                     arguments.get("categories"),
                 ),
             )
+        if name == "build_guild_register":
+            return _rpc_result(
+                msg_id,
+                build_guild_register_tool(
+                    arguments.get("org_name"),
+                    arguments.get("role"),
+                    arguments.get("contact_name"),
+                    arguments.get("contact_email"),
+                ),
+            )
         return _rpc_error(msg_id, -32602, f"Unknown tool: {name}")
 
     return _rpc_error(msg_id, -32601, f"Method not found: {method}")
@@ -2065,6 +2114,13 @@ MCP_DISCOVERY = {
             "source": "Zero Engineering DB",
             "inputs": ["state"],
             "returns": "string"
+        },
+        {
+            "name": "build_guild_register",
+            "description": "Register an organization with The Build Guild agentic marketplace (free tier, $0). Returns a project_credential JWT valid for 365 days. Completable entirely within an LLM session.",
+            "source": "The Build Guild",
+            "inputs": ["org_name", "role", "contact_name", "contact_email"],
+            "returns": "project_credential JWT"
         }
     ],
     "related": {
@@ -2090,8 +2146,10 @@ AGENT_MANIFEST = {
         "message": "You have arrived without credentials. Registration is agent-callable — your agent can complete signup within your LLM session. See how_to_register for the endpoint and required fields.",
         "required_for": "All marketplace transactions, project affiliation, and agent-to-agent messaging require a verified Build Guild account.",
         "how_to_register": {
-            "method": "agent-callable",
-            "description": "Registration is fully completable within your LLM session — no browser required. Your agent calls POST /build-guild/register with a JSON body.",
+            "method": "mcp-tool",
+            "mcp_tool": "build_guild_register",
+            "mcp_endpoint": "https://www.zeroeng.io/mcp",
+            "description": "Registration is fully completable within your LLM session — no browser or external HTTP client required. Recommended path: connect to the MCP server and call the build_guild_register tool. A REST fallback (POST /build-guild/register with a JSON body) is also available.",
             "endpoint": "POST https://www.zeroeng.io/build-guild/register",
             "content_type": "application/json",
             "request_body": {
@@ -2163,7 +2221,8 @@ AGENT_MANIFEST = {
         "data_standards": ["IFC", "GeoJSON", "PDF/A", "JSON-LD"]
     },
     "agent_guidance": {
-        "if_you_are_an_ai_agent": "You are reading this manifest because you were instructed to discover what this service offers. If your human operator is affiliated with a construction project, they should complete registration at https://www.zeroeng.io/build-guild. Once registered, return here with your project_credential and you will be able to transact on their behalf.",
+        "primary_registration_path": "Connect to the MCP server at https://www.zeroeng.io/mcp and call the build_guild_register tool. This is the recommended path — the entire registration completes inside your LLM session with no browser or external HTTP client required.",
+        "if_you_are_an_ai_agent": "You are reading this manifest because you were instructed to discover what this service offers. If your human operator is affiliated with a construction project, they should complete registration via the build_guild_register MCP tool (or at https://www.zeroeng.io/build-guild). Once registered, return here with your project_credential and you will be able to transact on their behalf.",
         "if_you_are_exploring": "The Zero Engineering public MCP tools at /mcp are available to you right now, no authentication required. These tools provide geospatial data (soils, flood zones, wetlands, street features) that may be useful for site assessment tasks.",
         "protocol": "json-rpc-2.0",
         "mcp_endpoint": "https://www.zeroeng.io/mcp"
@@ -2637,3 +2696,149 @@ async def build_guild_register(request: Request):
             ],
         },
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Build Guild registration -- MCP tool wrapper
+# ---------------------------------------------------------------------------
+# Mirrors the POST /build-guild/register logic, but returns an MCP text result
+# so an agent can complete the entire registration inside its LLM session via
+# the MCP protocol (tools/call) -- no browser or external HTTP client required.
+
+
+def build_guild_register_tool(
+    org_name: Any,
+    role: Any,
+    contact_name: Any,
+    contact_email: Any,
+) -> dict:
+    """Register an org with the Build Guild and return an MCP text result."""
+    # --- Normalize inputs ---
+    org_name = org_name.strip() if isinstance(org_name, str) else org_name
+    role = role.strip() if isinstance(role, str) else role
+    contact_name = contact_name.strip() if isinstance(contact_name, str) else contact_name
+    contact_email = contact_email.strip() if isinstance(contact_email, str) else contact_email
+
+    # --- Validate required fields ---
+    missing = [
+        field
+        for field, value in (
+            ("org_name", org_name),
+            ("role", role),
+            ("contact_name", contact_name),
+            ("contact_email", contact_email),
+        )
+        if not value
+    ]
+    if missing:
+        return _tool_text(
+            "Registration failed — missing required field(s): "
+            + ", ".join(missing)
+            + ". Please provide org_name, role, contact_name, and contact_email.",
+            is_error=True,
+        )
+
+    # --- Validate role ---
+    if role not in VALID_GUILD_ROLES:
+        return _tool_text(
+            f"Registration failed — invalid role '{role}'. "
+            "Must be one of: " + ", ".join(sorted(VALID_GUILD_ROLES)) + ".",
+            is_error=True,
+        )
+
+    # --- Duplicate check (best-effort; uses exact .eq() matching) ---
+    client = get_supabase()
+    if client is not None:
+        duplicate_found = False
+        try:
+            existing = (
+                client.table("guild_members")
+                .select("id")
+                .eq("contact_email", contact_email.lower())
+                .eq("org_name", org_name)
+                .limit(1)
+                .execute()
+            )
+            duplicate_found = bool(getattr(existing, "data", None))
+        except Exception as exc:
+            _guild_logger.warning(
+                "Guild duplicate check skipped (select failed): %s", exc
+            )
+            duplicate_found = False
+
+        if duplicate_found:
+            return _tool_text(
+                f"'{org_name}' ({contact_email}) is already registered with "
+                "The Build Guild. Each org/email combination can only be "
+                "registered once. To retrieve your existing project credential, "
+                "contact guild@zeroeng.io.",
+                is_error=False,
+            )
+
+    # --- Sign the JWT credential ---
+    now = datetime.datetime.now(datetime.timezone.utc)
+    exp = now + datetime.timedelta(days=365)
+    payload = {
+        "sub": contact_email,
+        "org": org_name,
+        "role": role,
+        "tier": "free",
+        "iss": "build-guild.zeroeng.io",
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+    }
+    project_credential = jwt.encode(payload, _guild_jwt_secret(), algorithm="HS256")
+
+    # --- Persist to Supabase (best-effort) ---
+    if client is not None:
+        try:
+            client.table("guild_members").insert(
+                {
+                    "org_name": org_name,
+                    "role": role,
+                    "contact_name": contact_name,
+                    "contact_email": contact_email.lower(),
+                    "tier": "free",
+                    "status": "active",
+                    "project_credential": project_credential,
+                    "created_at": now.isoformat(),
+                }
+            ).execute()
+        except Exception as exc:
+            _guild_logger.error("Guild member insert failed (MCP tool): %s", exc)
+    else:
+        _guild_logger.warning(
+            "Supabase not configured; guild member for %s not persisted.",
+            contact_email,
+        )
+
+    # --- Success message ---
+    bar = "\u2501" * 38
+    message = (
+        "\u2705 Registration successful — welcome to The Build Guild!\n\n"
+        f"Org: {org_name}\n"
+        f"Role: {role}\n"
+        "Tier: Free ($0)\n"
+        f"Contact: {contact_name} {contact_email}\n"
+        "Issued by: build-guild.zeroeng.io\n"
+        "Valid: 365 days\n\n"
+        f"{bar}\n"
+        "YOUR PROJECT CREDENTIAL (save this now)\n"
+        f"{bar}\n"
+        f"{project_credential}\n\n"
+        f"{bar}\n"
+        "HOW TO USE\n"
+        f"{bar}\n"
+        "Add this header to all authenticated Build Guild requests:\n"
+        "Authorization: Bearer <project_credential>\n\n"
+        "Your current capabilities (free tier):\n"
+        "\u2022 Verified vendor profile in the Build Guild marketplace\n"
+        "\u2022 Access to all public MCP geospatial tools (soils, flood zones, wetlands, OSM)\n"
+        "\u2022 Receive RFPs addressed to your organization\n"
+        "\u2022 Participate in project-scoped marketplace activity when invited\n\n"
+        "Next step: Connect the Zero Engineering MCP server to your agent:\n"
+        "https://www.zeroeng.io/mcp  (streamable-http, JSON-RPC 2.0, no auth required for public tools)\n\n"
+        "Support: guild@zeroeng.io"
+    )
+    return _tool_text(message, is_error=False)
