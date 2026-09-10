@@ -2328,52 +2328,6 @@ async def well_known_agent_manifest():
     return JSONResponse(content=AGENT_MANIFEST)
 
 
-@app.get("/debug/supabase")
-async def debug_supabase():
-    """TEMPORARY diagnostic endpoint — inspect Supabase config and connectivity."""
-    result = {
-        "supabase_url_prefix": os.environ.get("SUPABASE_URL", "")[:40],
-        "supabase_anon_key_set": bool(os.environ.get("SUPABASE_ANON_KEY")),
-        "client_initialized": False,
-        "select": None,
-        "insert": None,
-    }
-
-    client = get_supabase()
-    result["client_initialized"] = client is not None
-    if client is None:
-        result["error"] = "get_supabase() returned None (URL/key missing or client init failed)."
-        return JSONResponse(content=result)
-
-    # --- Direct select ---
-    try:
-        resp = client.table("guild_members").select("id").execute()
-        rows = getattr(resp, "data", None) or []
-        result["select"] = {"ok": True, "row_count": len(rows)}
-    except Exception as exc:
-        result["select"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-    # --- Test insert ---
-    try:
-        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        client.table("guild_members").insert(
-            {
-                "org_name": "_debug",
-                "role": "Vendor",
-                "contact_name": "debug",
-                "contact_email": "_debug@zeroeng-test.invalid",
-                "tier": "free",
-                "status": "active",
-                "created_at": now_iso,
-            }
-        ).execute()
-        result["insert"] = {"ok": True}
-    except Exception as exc:
-        result["insert"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-    return JSONResponse(content=result)
-
-
 @app.get("/build-guild", response_class=HTMLResponse)
 async def build_guild():
     return BUILD_GUILD_PAGE
