@@ -2328,6 +2328,52 @@ async def well_known_agent_manifest():
     return JSONResponse(content=AGENT_MANIFEST)
 
 
+@app.get("/debug/supabase")
+async def debug_supabase():
+    """TEMPORARY diagnostic endpoint — inspect Supabase config and connectivity."""
+    result = {
+        "supabase_url_prefix": os.environ.get("SUPABASE_URL", "")[:40],
+        "supabase_anon_key_set": bool(os.environ.get("SUPABASE_ANON_KEY")),
+        "client_initialized": False,
+        "select": None,
+        "insert": None,
+    }
+
+    client = get_supabase()
+    result["client_initialized"] = client is not None
+    if client is None:
+        result["error"] = "get_supabase() returned None (URL/key missing or client init failed)."
+        return JSONResponse(content=result)
+
+    # --- Direct select ---
+    try:
+        resp = client.table("guild_members").select("id").execute()
+        rows = getattr(resp, "data", None) or []
+        result["select"] = {"ok": True, "row_count": len(rows)}
+    except Exception as exc:
+        result["select"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    # --- Test insert ---
+    try:
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        client.table("guild_members").insert(
+            {
+                "org_name": "_debug",
+                "role": "Vendor",
+                "contact_name": "debug",
+                "contact_email": "_debug@zeroeng-test.invalid",
+                "tier": "free",
+                "status": "active",
+                "created_at": now_iso,
+            }
+        ).execute()
+        result["insert"] = {"ok": True}
+    except Exception as exc:
+        result["insert"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    return JSONResponse(content=result)
+
+
 @app.get("/build-guild", response_class=HTMLResponse)
 async def build_guild():
     return BUILD_GUILD_PAGE
@@ -2630,6 +2676,7 @@ def build_guild_register_tool(
     project_credential = jwt.encode(payload, _guild_jwt_secret(), algorithm="HS256")
 
     # --- Persist to Supabase (best-effort) ---
+    write_error = None
     if client is not None:
         try:
             client.table("guild_members").insert(
@@ -2646,11 +2693,13 @@ def build_guild_register_tool(
             ).execute()
         except Exception as exc:
             _guild_logger.error("Guild member insert failed (MCP tool): %s", exc)
+            write_error = f"{type(exc).__name__}: {exc}"
     else:
         _guild_logger.warning(
             "Supabase not configured; guild member for %s not persisted.",
             contact_email,
         )
+        write_error = "Supabase client not configured (SUPABASE_URL / SUPABASE_ANON_KEY missing)."
 
     # --- Success message ---
     bar = "\u2501" * 38
@@ -2680,4 +2729,6 @@ def build_guild_register_tool(
         "https://www.zeroeng.io/mcp  (streamable-http, JSON-RPC 2.0, no auth required for public tools)\n\n"
         "Support: guild@zeroeng.io"
     )
+    if write_error:
+        message += f"\n\n\u26a0\ufe0f Supabase write failed: {write_error}"
     return _tool_text(message, is_error=False)
