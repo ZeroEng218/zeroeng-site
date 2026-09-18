@@ -196,6 +196,30 @@ PAGE = """<!DOCTYPE html>
         .foot-links { display: flex; gap: 1.3rem; font-size: 0.8rem; }
         .foot-links a { color: var(--muted); } .foot-links a:hover { color: var(--cyan); }
 
+        /* Build Guild Banner */
+        .bg-banner {
+            background: linear-gradient(135deg, #1a1200 0%, #201800 60%, #0f0d00 100%);
+            border: 1px solid rgba(240,165,0,0.35);
+            border-radius: 16px;
+            padding: 1.8rem 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1.5rem;
+            flex-wrap: wrap;
+            box-shadow: 0 0 40px -10px rgba(240,165,0,0.2);
+            margin: 2rem auto 0;
+            max-width: 760px;
+        }
+        .bg-banner-left { display: flex; align-items: center; gap: 1rem; }
+        .bg-icon { font-size: 2.2rem; }
+        .bg-banner-text {}
+        .bg-banner-eyebrow { font-family: 'IBM Plex Mono', monospace; font-size: 0.65rem; letter-spacing: 0.2em; text-transform: uppercase; color: #f0a500; margin-bottom: 0.25rem; }
+        .bg-banner-title { font-size: 1.1rem; font-weight: 700; color: #fff; letter-spacing: -0.01em; }
+        .bg-banner-sub { font-size: 0.82rem; color: #b8a060; margin-top: 0.2rem; }
+        .btn-guild { background: #f0a500; color: #0f0a00; border: none; font-family: inherit; font-size: 0.88rem; font-weight: 700; padding: 0.75rem 1.4rem; border-radius: 10px; cursor: pointer; transition: all 0.15s; white-space: nowrap; text-decoration: none; display: inline-block; }
+        .btn-guild:hover { background: #ffc233; color: #0f0a00; transform: translateY(-1px); }
+
         /* toast */
         .toast { position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--green); color: #04120a; font-weight: 600; font-size: 0.85rem; padding: 0.7rem 1.3rem; border-radius: 9px; opacity: 0; pointer-events: none; transition: all 0.25s; z-index: 100; }
         .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
@@ -251,6 +275,19 @@ PAGE = """<!DOCTYPE html>
       </div>
       <p class="conn-note">Compatible with Abacus AI, Claude Desktop, Cursor, Windsurf, and any MCP client.</p>
     </div>
+
+    <a href="/build-guild" class="bg-banner" style="text-decoration:none;">
+      <div class="bg-banner-left">
+        <div class="bg-icon">&#127963;</div>
+        <div class="bg-banner-text">
+          <div class="bg-banner-eyebrow">Agentic Marketplace &bull; Now Open</div>
+          <div class="bg-banner-title">The Build Guild</div>
+          <div class="bg-banner-sub">Register your firm and connect AI agents across the built environment &mdash; free to join.</div>
+        </div>
+      </div>
+      <span class="btn-guild">Join the Guild &rarr;</span>
+    </a>
+
   </div>
 </header>
 
