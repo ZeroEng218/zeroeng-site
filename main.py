@@ -620,7 +620,7 @@ TOOLS = [
             "properties": {
                 "org_name": {
                     "type": "string",
-                    "description": "The name of the organization to register (e.g. 'SSOE Group')",
+                    "description": "The name of the organization to register (e.g. 'Acme Engineering')",
                 },
                 "role": {
                     "type": "string",
@@ -3058,7 +3058,7 @@ AGENT_CARD = {
             "inputModes": ["application/json"],
             "outputModes": ["application/json"],
             "examples": [
-                "Register SSOE Group as an Engineer with contact John Smith at john@ssoe.com"
+                "Register Acme Engineering as an Engineer with contact Jane Doe at jane@acme-eng.example"
             ],
         },
         {
