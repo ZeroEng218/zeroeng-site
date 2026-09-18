@@ -635,8 +635,49 @@ TOOLS = [
                     "type": "string",
                     "description": "Email address of the primary contact person",
                 },
+                "a2a_endpoint": {
+                    "type": "string",
+                    "description": (
+                        "Optional. Your organization's own A2A (Agent-to-Agent) "
+                        "endpoint URL. If provided, your agent becomes directly "
+                        "discoverable and callable by other verified Guild members "
+                        "via the member directory."
+                    ),
+                },
             },
             "required": ["org_name", "role", "contact_name", "contact_email"],
+        },
+    },
+    {
+        "name": "find_agents",
+        "description": (
+            "Search the Build Guild member directory for registered AEC "
+            "organizations. Optionally filter by role or restrict to members "
+            "with A2A endpoints for direct agent-to-agent communication. "
+            "Requires a valid project_credential JWT from build_guild_register."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_credential": {
+                    "type": "string",
+                    "description": "Your Build Guild project_credential JWT (from build_guild_register). Required.",
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["Architect", "Engineer", "Contractor", "Vendor", "Owner"],
+                    "description": "Filter by AEC role (optional — omit to return all roles)",
+                },
+                "a2a_only": {
+                    "type": "boolean",
+                    "description": "If true, only return members that have registered an A2A endpoint",
+                },
+                "search": {
+                    "type": "string",
+                    "description": "Optional text search across org_name (case-insensitive)",
+                },
+            },
+            "required": ["project_credential"],
         },
     },
 ]
@@ -1904,6 +1945,17 @@ def _handle_rpc(message: dict) -> Optional[dict]:
                     arguments.get("role"),
                     arguments.get("contact_name"),
                     arguments.get("contact_email"),
+                    arguments.get("a2a_endpoint"),
+                ),
+            )
+        if name == "find_agents":
+            return _rpc_result(
+                msg_id,
+                find_agents_tool(
+                    arguments.get("project_credential"),
+                    arguments.get("role"),
+                    arguments.get("a2a_only"),
+                    arguments.get("search"),
                 ),
             )
         return _rpc_error(msg_id, -32602, f"Unknown tool: {name}")
@@ -1993,15 +2045,24 @@ MCP_DISCOVERY = {
         },
         {
             "name": "build_guild_register",
-            "description": "Register an organization with The Build Guild agentic marketplace (free tier, $0). Returns a project_credential JWT valid for 365 days. Completable entirely within an LLM session.",
+            "description": "Register an organization with The Build Guild agentic marketplace (free tier, $0). Returns a project_credential JWT valid for 365 days. Completable entirely within an LLM session. Optionally accepts an a2a_endpoint.",
             "source": "The Build Guild",
-            "inputs": ["org_name", "role", "contact_name", "contact_email"],
+            "inputs": ["org_name", "role", "contact_name", "contact_email", "a2a_endpoint (optional)"],
             "returns": "project_credential JWT"
+        },
+        {
+            "name": "find_agents",
+            "description": "Search the Build Guild member directory for registered AEC organizations. Filter by role or restrict to members with A2A endpoints. Requires a valid project_credential JWT.",
+            "source": "The Build Guild",
+            "inputs": ["project_credential", "role (optional)", "a2a_only (optional)", "search (optional)"],
+            "returns": "list of members"
         }
     ],
     "related": {
         "build_guild": "https://www.zeroeng.io/build-guild",
         "agent_manifest": "https://www.zeroeng.io/.well-known/agent-manifest",
+        "a2a_agent_card": "https://www.zeroeng.io/.well-known/agent.json",
+        "a2a_endpoint": "https://www.zeroeng.io/a2a",
         "llms_txt": "https://www.zeroeng.io/llms.txt"
     }
 }
@@ -2224,6 +2285,14 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
         .agent-box .url { color: var(--amber-soft); }
         .agent-copy { position: absolute; top: 1rem; right: 1rem; padding: 0.45rem 0.85rem; font-size: 0.74rem; }
         .agent-note { max-width: 840px; margin: 1rem auto 0; text-align: center; font-size: 0.82rem; color: var(--faint); }
+        .sec-head .kicker { display:inline-block; font-family:'IBM Plex Mono',monospace; font-size: 0.72rem; letter-spacing: 0.22em; text-transform: uppercase; color: var(--amber); margin-bottom: 0.7rem; }
+        .a2a-lede { max-width: 760px; margin: 0 auto 2rem; text-align: center; font-size: 0.95rem; color: var(--muted); font-weight: 300; line-height: 1.7; }
+        .a2a-skills { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.1rem; max-width: 960px; margin: 2rem auto 0; }
+        @media (max-width: 720px){ .a2a-skills { grid-template-columns: 1fr; } }
+        .a2a-skill { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--amber); border-radius: 12px; padding: 1.4rem 1.5rem; transition: transform 0.2s, border-color 0.2s, background 0.2s; }
+        .a2a-skill:hover { transform: translateY(-4px); background: var(--panel-hi); border-color: var(--border-hi); border-left-color: var(--amber); }
+        .a2a-skill .as-id { font-family: 'IBM Plex Mono', monospace; font-size: 0.95rem; font-weight: 600; color: var(--amber); margin-bottom: 0.5rem; }
+        .a2a-skill p { font-size: 0.85rem; color: var(--muted); font-weight: 300; line-height: 1.6; }
 
         /* Early access panel */
         .ea-panel { max-width: 860px; margin: 0 auto; text-align: center; background: linear-gradient(180deg, rgba(240,165,0,0.10), rgba(240,165,0,0.03)); border: 1px solid var(--border-hi); border-radius: 16px; padding: 3rem 2rem; }
@@ -2301,11 +2370,41 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
 
 <span class="verb">GET</span>  <span class="url">https://www.zeroeng.io/.well-known/agent-manifest</span>
 <span class="verb">GET</span>  <span class="url">https://www.zeroeng.io/.well-known/mcp.json</span>
+<span class="verb">GET</span>  <span class="url">https://www.zeroeng.io/.well-known/agent.json</span>    <span class="cmt"># A2A Agent Card</span>
 
 <span class="cmt"># Public MCP tools are available now — no credentials required:</span>
-<span class="verb">POST</span> <span class="url">https://www.zeroeng.io/mcp</span>  <span class="cmt">(JSON-RPC 2.0, streamable-http)</span></pre>
+<span class="verb">POST</span> <span class="url">https://www.zeroeng.io/mcp</span>  <span class="cmt">(JSON-RPC 2.0, streamable-http)</span>
+<span class="verb">POST</span> <span class="url">https://www.zeroeng.io/a2a</span>  <span class="cmt"># A2A Endpoint (JSON-RPC 2.0)</span></pre>
     </div>
     <p class="agent-note">The public MCP tools &mdash; soils, flood zones, wetlands, OpenStreetMap &mdash; are available to any agent without authentication.</p>
+  </div>
+</section>
+
+<section id="a2a" style="border-top:1px solid var(--border);">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">A2A Protocol</span>
+      <h2>Direct Agent Communication</h2>
+    </div>
+    <p class="a2a-lede">Build Guild members can register their own A2A endpoint, making their agent directly discoverable and callable by other verified members. Once registered, any agent in the Guild can query the member directory to find your endpoint and open a direct channel &mdash; no human in the loop required for routine project communication.</p>
+    <div class="agent-box">
+<pre><span class="verb">GET</span>  <span class="url">https://www.zeroeng.io/.well-known/agent.json</span>   <span class="cmt"># Agent Card</span>
+<span class="verb">POST</span> <span class="url">https://www.zeroeng.io/a2a</span>                       <span class="cmt"># A2A Endpoint (JSON-RPC 2.0)</span></pre>
+    </div>
+    <div class="a2a-skills">
+      <div class="a2a-skill">
+        <div class="as-id">register</div>
+        <p>Register a firm and receive a 365-day project_credential JWT. Optionally include your own A2A endpoint to become discoverable.</p>
+      </div>
+      <div class="a2a-skill">
+        <div class="as-id">find_agents</div>
+        <p>Search the member directory by role, or restrict to members with A2A endpoints. Requires a valid Bearer credential.</p>
+      </div>
+      <div class="a2a-skill">
+        <div class="as-id">verify_credential</div>
+        <p>Verify a Build Guild project_credential JWT and return the decoded identity &mdash; org, role, and tier.</p>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -2394,6 +2493,147 @@ def _guild_jwt_secret() -> str:
     return secret
 
 
+# ---------------------------------------------------------------------------
+# Shared credential + directory helpers (used by MCP find_agents and A2A)
+# ---------------------------------------------------------------------------
+
+def _guild_verify_jwt(token: Any) -> dict:
+    """Decode/validate a project_credential JWT.
+
+    Returns {"valid": True, "claims": {...}} on success, or
+    {"valid": False, "error": "..."} on failure.
+    """
+    if not token or not isinstance(token, str) or not token.strip():
+        return {"valid": False, "error": "No credential token provided."}
+    try:
+        claims = jwt.decode(token.strip(), _guild_jwt_secret(), algorithms=["HS256"])
+    except Exception as exc:  # ExpiredSignatureError, JWTError, etc.
+        return {"valid": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"valid": True, "claims": claims}
+
+
+def _extract_bearer(auth_header: Any) -> Optional[str]:
+    """Pull the token out of an 'Authorization: Bearer <token>' header value."""
+    if not auth_header or not isinstance(auth_header, str):
+        return None
+    parts = auth_header.strip().split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1].strip()
+    # Also tolerate a bare token being passed.
+    return auth_header.strip() or None
+
+
+def _query_guild_directory(role=None, a2a_only=False, search=None) -> dict:
+    """Query guild_members for the public directory.
+
+    Returns {"ok": True, "members": [...]} or {"ok": False, "error": "..."}.
+    Never exposes project_credential or internal fields.
+    """
+    client = get_supabase()
+    if client is None:
+        return {
+            "ok": False,
+            "error": "Supabase is not configured (SUPABASE_URL / SUPABASE_ANON_KEY missing).",
+        }
+
+    # Select only safe, public columns. a2a_endpoint may not exist yet -- if the
+    # select errors on it, retry without it.
+    cols_with_a2a = "org_name, role, contact_name, tier, created_at, a2a_endpoint"
+    cols_basic = "org_name, role, contact_name, tier, created_at"
+
+    def _run(select_cols, include_a2a_filter):
+        q = client.table("guild_members").select(select_cols)
+        if role:
+            q = q.eq("role", role)
+        if search and isinstance(search, str) and search.strip():
+            escaped = search.strip().replace("%", r"\%").replace("_", r"\_")
+            q = q.ilike("org_name", f"%{escaped}%")
+        if include_a2a_filter and a2a_only:
+            q = q.not_.is_("a2a_endpoint", "null")
+        return q.execute()
+
+    try:
+        resp = _run(cols_with_a2a, True)
+        rows = getattr(resp, "data", None) or []
+    except Exception as exc:
+        # a2a_endpoint column likely not provisioned -- fall back to basic cols.
+        _guild_logger.warning("Directory query with a2a_endpoint failed (%s); "
+                              "falling back to basic columns.", exc)
+        try:
+            resp = _run(cols_basic, False)
+            rows = getattr(resp, "data", None) or []
+            if a2a_only:
+                # Column doesn't exist -> no members can have an endpoint.
+                rows = []
+        except Exception as exc2:
+            return {"ok": False, "error": f"{type(exc2).__name__}: {exc2}"}
+
+    members = []
+    for r in rows:
+        m = {
+            "org_name": r.get("org_name"),
+            "role": r.get("role"),
+            "contact_name": r.get("contact_name"),
+            "tier": r.get("tier"),
+            "created_at": r.get("created_at"),
+        }
+        if r.get("a2a_endpoint"):
+            m["a2a_endpoint"] = r.get("a2a_endpoint")
+        members.append(m)
+    return {"ok": True, "members": members}
+
+
+def find_agents_tool(project_credential: Any, role: Any = None,
+                     a2a_only: Any = None, search: Any = None) -> dict:
+    """MCP tool: search the Build Guild member directory (requires JWT)."""
+    verify = _guild_verify_jwt(project_credential)
+    if not verify["valid"]:
+        return _tool_text(
+            "Directory access denied — invalid or missing project_credential. "
+            f"({verify['error']}) Register with build_guild_register to obtain one.",
+            is_error=True,
+        )
+
+    if role and role not in VALID_GUILD_ROLES:
+        return _tool_text(
+            f"Invalid role '{role}'. Must be one of: "
+            + ", ".join(sorted(VALID_GUILD_ROLES)) + ".",
+            is_error=True,
+        )
+
+    result = _query_guild_directory(
+        role=role, a2a_only=bool(a2a_only), search=search
+    )
+    if not result["ok"]:
+        return _tool_text(f"Directory query failed: {result['error']}", is_error=True)
+
+    members = result["members"]
+    caller = verify["claims"].get("org", "your organization")
+    if not members:
+        return _tool_text(
+            f"No Build Guild members matched your query"
+            + (f" (role={role})" if role else "")
+            + (" with A2A endpoints" if a2a_only else "")
+            + (f" matching '{search}'" if search else "")
+            + ".",
+            is_error=False,
+        )
+
+    lines = [
+        f"Build Guild member directory — {len(members)} result(s)"
+        f" (query by {caller}):",
+        "",
+    ]
+    for i, m in enumerate(members, 1):
+        line = f"{i}. {m.get('org_name')} — {m.get('role')} (tier: {m.get('tier')})"
+        if m.get("a2a_endpoint"):
+            line += f"\n   A2A endpoint: {m['a2a_endpoint']}"
+        lines.append(line)
+    lines.append("")
+    lines.append(json.dumps({"members": members}))
+    return _tool_text("\n".join(lines), is_error=False)
+
+
 @app.post("/build-guild/register", status_code=201)
 async def build_guild_register(request: Request):
     """Agent-callable registration for the Build Guild.
@@ -2426,6 +2666,7 @@ async def build_guild_register(request: Request):
     role = (body.get("role") or "").strip() if isinstance(body.get("role"), str) else body.get("role")
     contact_name = (body.get("contact_name") or "").strip() if isinstance(body.get("contact_name"), str) else body.get("contact_name")
     contact_email = (body.get("contact_email") or "").strip() if isinstance(body.get("contact_email"), str) else body.get("contact_email")
+    a2a_endpoint = (body.get("a2a_endpoint") or "").strip() if isinstance(body.get("a2a_endpoint"), str) else body.get("a2a_endpoint")
 
     # --- Validate required fields ---
     missing = [
@@ -2525,23 +2766,38 @@ async def build_guild_register(request: Request):
 
     # --- Persist to Supabase (best-effort) ---
     if client is not None:
+        row = {
+            "org_name": org_name.strip(),
+            "role": role,
+            "contact_name": contact_name.strip(),
+            "contact_email": contact_email.lower().strip(),
+            "tier": "free",
+            "status": "active",
+            "project_credential": project_credential,
+            "created_at": now.isoformat(),
+        }
+        if a2a_endpoint:
+            row["a2a_endpoint"] = a2a_endpoint
         try:
-            client.table("guild_members").insert(
-                {
-                    "org_name": org_name.strip(),
-                    "role": role,
-                    "contact_name": contact_name.strip(),
-                    "contact_email": contact_email.lower().strip(),
-                    "tier": "free",
-                    "status": "active",
-                    "project_credential": project_credential,
-                    "created_at": now.isoformat(),
-                }
-            ).execute()
+            client.table("guild_members").insert(row).execute()
         except Exception as exc:
-            # Table may not exist yet -- still return the credential so the
-            # endpoint is testable before the table is provisioned.
-            _guild_logger.error("Guild member insert failed: %s", exc)
+            # If the a2a_endpoint column is not yet provisioned, retry without it.
+            if "a2a_endpoint" in row:
+                _guild_logger.warning(
+                    "Insert with a2a_endpoint failed (%s); retrying without it. "
+                    "Run migration: ALTER TABLE public.guild_members "
+                    "ADD COLUMN IF NOT EXISTS a2a_endpoint TEXT;",
+                    exc,
+                )
+                row.pop("a2a_endpoint", None)
+                try:
+                    client.table("guild_members").insert(row).execute()
+                except Exception as exc2:
+                    _guild_logger.error("Guild member insert failed: %s", exc2)
+            else:
+                # Table may not exist yet -- still return the credential so the
+                # endpoint is testable before the table is provisioned.
+                _guild_logger.error("Guild member insert failed: %s", exc)
     else:
         _guild_logger.warning(
             "Supabase not configured; guild member for %s not persisted.",
@@ -2556,6 +2812,7 @@ async def build_guild_register(request: Request):
             "org_name": org_name,
             "role": role,
             "tier": "free",
+            "a2a_endpoint": a2a_endpoint or None,
             "project_credential": project_credential,
             "instructions": {
                 "how_to_use": "Include this credential in the Authorization header of all Build Guild requests.",
@@ -2588,6 +2845,7 @@ def build_guild_register_tool(
     role: Any,
     contact_name: Any,
     contact_email: Any,
+    a2a_endpoint: Any = None,
 ) -> dict:
     """Register an org with the Build Guild and return an MCP text result."""
     # --- Normalize inputs ---
@@ -2595,6 +2853,7 @@ def build_guild_register_tool(
     role = role.strip() if isinstance(role, str) else role
     contact_name = contact_name.strip() if isinstance(contact_name, str) else contact_name
     contact_email = contact_email.strip() if isinstance(contact_email, str) else contact_email
+    a2a_endpoint = a2a_endpoint.strip() if isinstance(a2a_endpoint, str) else a2a_endpoint
 
     # --- Validate required fields ---
     missing = [
@@ -2669,22 +2928,39 @@ def build_guild_register_tool(
     # --- Persist to Supabase (best-effort) ---
     write_error = None
     if client is not None:
+        row = {
+            "org_name": org_name,
+            "role": role,
+            "contact_name": contact_name,
+            "contact_email": contact_email.lower(),
+            "tier": "free",
+            "status": "active",
+            "project_credential": project_credential,
+            "created_at": now.isoformat(),
+        }
+        if a2a_endpoint:
+            row["a2a_endpoint"] = a2a_endpoint
         try:
-            client.table("guild_members").insert(
-                {
-                    "org_name": org_name,
-                    "role": role,
-                    "contact_name": contact_name,
-                    "contact_email": contact_email.lower(),
-                    "tier": "free",
-                    "status": "active",
-                    "project_credential": project_credential,
-                    "created_at": now.isoformat(),
-                }
-            ).execute()
+            client.table("guild_members").insert(row).execute()
         except Exception as exc:
-            _guild_logger.error("Guild member insert failed (MCP tool): %s", exc)
-            write_error = f"{type(exc).__name__}: {exc}"
+            # If the a2a_endpoint column is not yet provisioned, retry without it
+            # so registration still succeeds.
+            if "a2a_endpoint" in row:
+                _guild_logger.warning(
+                    "Insert with a2a_endpoint failed (%s); retrying without it. "
+                    "Run migration: ALTER TABLE public.guild_members "
+                    "ADD COLUMN IF NOT EXISTS a2a_endpoint TEXT;",
+                    exc,
+                )
+                row.pop("a2a_endpoint", None)
+                try:
+                    client.table("guild_members").insert(row).execute()
+                except Exception as exc2:
+                    _guild_logger.error("Guild member insert failed (MCP tool): %s", exc2)
+                    write_error = f"{type(exc2).__name__}: {exc2}"
+            else:
+                _guild_logger.error("Guild member insert failed (MCP tool): %s", exc)
+                write_error = f"{type(exc).__name__}: {exc}"
     else:
         _guild_logger.warning(
             "Supabase not configured; guild member for %s not persisted.",
@@ -2700,7 +2976,8 @@ def build_guild_register_tool(
         f"Role: {role}\n"
         "Tier: Free ($0)\n"
         f"Contact: {contact_name} {contact_email}\n"
-        "Issued by: build-guild.zeroeng.io\n"
+        + (f"A2A endpoint: {a2a_endpoint}\n" if a2a_endpoint else "")
+        + "Issued by: build-guild.zeroeng.io\n"
         "Valid: 365 days\n\n"
         f"{bar}\n"
         "YOUR PROJECT CREDENTIAL (save this now)\n"
@@ -2723,3 +3000,488 @@ def build_guild_register_tool(
     if write_error:
         message += f"\n\n\u26a0\ufe0f Supabase write failed: {write_error}"
     return _tool_text(message, is_error=False)
+
+
+
+# ---------------------------------------------------------------------------
+# A2A (Agent-to-Agent) protocol support
+# ---------------------------------------------------------------------------
+# The Build Guild speaks Google's open A2A spec (https://google.github.io/A2A/):
+#   * Publishes an Agent Card at GET /.well-known/agent.json
+#   * Exposes a JSON-RPC 2.0 endpoint at POST /a2a
+#   * Brokers a member-agent directory so registered firms can discover and
+#     call each other's A2A endpoints directly.
+#
+# Supabase migration required for the member-agent directory:
+#   ALTER TABLE public.guild_members ADD COLUMN IF NOT EXISTS a2a_endpoint TEXT;
+# (Attempted automatically at startup via the Supabase Management API when
+#  SUPABASE_SERVICE_ROLE_KEY + SUPABASE_PROJECT_REF are set; otherwise logged.)
+
+A2A_ENDPOINT_URL = "https://www.zeroeng.io/a2a"
+
+AGENT_CARD = {
+    "name": "The Build Guild",
+    "description": (
+        "An agentic marketplace for the built environment. AI agents acting on "
+        "behalf of architects, engineers, contractors, vendors, and owners can "
+        "register, discover peers, and conduct project business here."
+    ),
+    "url": A2A_ENDPOINT_URL,
+    "iconUrl": "https://www.zeroeng.io/favicon.ico",
+    "version": "0.1.0",
+    "documentationUrl": "https://www.zeroeng.io/build-guild",
+    "capabilities": {
+        "streaming": False,
+        "pushNotifications": False,
+        "stateTransitionHistory": False,
+    },
+    "authentication": {
+        "schemes": ["Bearer"],
+        "credentials": (
+            "project_credential JWT issued on registration. Required for "
+            "find_agents and verify_credential. Optional for register "
+            "(unauthenticated registration is permitted)."
+        ),
+    },
+    "defaultInputModes": ["application/json", "text/plain"],
+    "defaultOutputModes": ["application/json", "text/plain"],
+    "skills": [
+        {
+            "id": "register",
+            "name": "Register Organization",
+            "description": (
+                "Register a firm with The Build Guild. Returns a "
+                "project_credential JWT valid for 365 days. Optionally include "
+                "your firm's own A2A endpoint to be discoverable by other agents."
+            ),
+            "tags": ["registration", "onboarding", "marketplace"],
+            "inputModes": ["application/json"],
+            "outputModes": ["application/json"],
+            "examples": [
+                "Register SSOE Group as an Engineer with contact John Smith at john@ssoe.com"
+            ],
+        },
+        {
+            "id": "find_agents",
+            "name": "Find Agents",
+            "description": (
+                "Search the Build Guild member directory for registered "
+                "organizations. Filter by role (Architect, Engineer, Contractor, "
+                "Vendor, Owner). Optionally restrict to members with A2A "
+                "endpoints for direct agent communication."
+            ),
+            "tags": ["discovery", "directory", "agents"],
+            "inputModes": ["application/json"],
+            "outputModes": ["application/json"],
+            "examples": [
+                "Find all registered Engineers with A2A endpoints",
+                "Show me Contractor members",
+            ],
+        },
+        {
+            "id": "verify_credential",
+            "name": "Verify Credential",
+            "description": (
+                "Verify a Build Guild project_credential JWT. Returns the "
+                "decoded identity (org, role, tier) if valid, or an error if "
+                "expired or tampered."
+            ),
+            "tags": ["auth", "verification", "identity"],
+            "inputModes": ["application/json"],
+            "outputModes": ["application/json"],
+            "examples": ["Verify this JWT: eyJ..."],
+        },
+    ],
+}
+
+A2A_SKILLS_SUMMARY = {
+    "register": "Register a firm; returns a 365-day project_credential JWT. "
+                "Arguments: org_name, role, contact_name, contact_email, "
+                "a2a_endpoint (optional).",
+    "find_agents": "Search the member directory (Bearer token required). "
+                   "Arguments: role (optional), a2a_only (optional bool), "
+                   "search (optional).",
+    "verify_credential": "Decode/validate a project_credential JWT. "
+                         "Arguments: token.",
+}
+
+
+# ── A2A skill handlers ─────────────────────────────────────────────────────
+
+def _a2a_skill_register(arguments: dict, auth_header: Optional[str]) -> dict:
+    """A2A register skill — wraps build_guild_register_tool, returns a data dict."""
+    arguments = arguments or {}
+    org_name = arguments.get("org_name")
+    role = arguments.get("role")
+    contact_name = arguments.get("contact_name")
+    contact_email = arguments.get("contact_email")
+    a2a_endpoint = arguments.get("a2a_endpoint")
+
+    result = build_guild_register_tool(
+        org_name, role, contact_name, contact_email, a2a_endpoint
+    )
+    # build_guild_register_tool returns an MCP-style text result. Extract text
+    # and pull the project_credential (JWT) if registration succeeded.
+    text = ""
+    try:
+        text = result["content"][0]["text"]
+    except Exception:
+        text = str(result)
+    is_error = bool(result.get("isError"))
+
+    credential = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("eyJ") and "." in line:
+            credential = line
+            break
+
+    data = {
+        "skill": "register",
+        "ok": not is_error and credential is not None,
+        "message": text,
+    }
+    if credential:
+        data.update(
+            {
+                "status": "registered",
+                "org_name": (org_name.strip() if isinstance(org_name, str) else org_name),
+                "role": role,
+                "tier": "free",
+                "a2a_endpoint": (a2a_endpoint.strip() if isinstance(a2a_endpoint, str) else a2a_endpoint) or None,
+                "project_credential": credential,
+                "how_to_use": "Authorization: Bearer <project_credential>",
+            }
+        )
+    return data
+
+
+def _a2a_skill_find_agents(arguments: dict, auth_header: Optional[str]) -> dict:
+    """A2A find_agents skill — requires a Bearer token in auth_header."""
+    arguments = arguments or {}
+    token = _extract_bearer(auth_header)
+    # Allow the token to also be passed explicitly in arguments as a fallback.
+    if not token:
+        token = arguments.get("project_credential") or arguments.get("token")
+
+    verify = _guild_verify_jwt(token)
+    if not verify["valid"]:
+        return {
+            "skill": "find_agents",
+            "ok": False,
+            "error": "unauthorized",
+            "message": (
+                "find_agents requires a valid Build Guild credential. Present it "
+                "as 'Authorization: Bearer <project_credential>'. "
+                f"({verify['error']})"
+            ),
+        }
+
+    role = arguments.get("role")
+    if role and role not in VALID_GUILD_ROLES:
+        return {
+            "skill": "find_agents",
+            "ok": False,
+            "error": "invalid_role",
+            "message": "Invalid role. Must be one of: "
+            + ", ".join(sorted(VALID_GUILD_ROLES)) + ".",
+        }
+
+    result = _query_guild_directory(
+        role=role,
+        a2a_only=bool(arguments.get("a2a_only")),
+        search=arguments.get("search"),
+    )
+    if not result["ok"]:
+        return {
+            "skill": "find_agents",
+            "ok": False,
+            "error": "query_failed",
+            "message": result["error"],
+        }
+    return {
+        "skill": "find_agents",
+        "ok": True,
+        "count": len(result["members"]),
+        "members": result["members"],
+        "queried_by": verify["claims"].get("org"),
+    }
+
+
+def _a2a_skill_verify_credential(arguments: dict) -> dict:
+    """A2A verify_credential skill — decode + validate a JWT."""
+    arguments = arguments or {}
+    token = arguments.get("token") or arguments.get("project_credential")
+    verify = _guild_verify_jwt(token)
+    if not verify["valid"]:
+        return {
+            "skill": "verify_credential",
+            "ok": False,
+            "valid": False,
+            "error": verify["error"],
+        }
+    claims = verify["claims"]
+    now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    exp = claims.get("exp")
+    expires_in_days = None
+    if isinstance(exp, (int, float)):
+        expires_in_days = round((exp - now_ts) / 86400, 1)
+    return {
+        "skill": "verify_credential",
+        "ok": True,
+        "valid": True,
+        "org": claims.get("org"),
+        "role": claims.get("role"),
+        "tier": claims.get("tier"),
+        "sub": claims.get("sub"),
+        "iss": claims.get("iss"),
+        "iat": claims.get("iat"),
+        "exp": exp,
+        "expires_in_days": expires_in_days,
+    }
+
+
+# ── A2A JSON-RPC helpers ───────────────────────────────────────────────────
+
+def _a2a_task_result(task_id: Any, state: str, data: Any = None,
+                     text: Optional[str] = None) -> dict:
+    """Build an A2A Task object (per the A2A spec) for a JSON-RPC result."""
+    parts = []
+    if data is not None:
+        parts.append({"type": "data", "data": data})
+    if text is not None:
+        parts.append({"type": "text", "text": text})
+    return {
+        "id": task_id,
+        "status": {
+            "state": state,
+            "message": {
+                "role": "agent",
+                "parts": parts,
+            },
+        },
+        "artifacts": [],
+    }
+
+
+def _a2a_dispatch_skill(skill: str, arguments: dict,
+                        auth_header: Optional[str]) -> tuple:
+    """Route a skill call. Returns (state, data_dict)."""
+    if skill == "register":
+        data = _a2a_skill_register(arguments, auth_header)
+        return ("completed", data)
+    if skill == "find_agents":
+        data = _a2a_skill_find_agents(arguments, auth_header)
+        state = "completed" if data.get("ok") else "failed"
+        return (state, data)
+    if skill == "verify_credential":
+        data = _a2a_skill_verify_credential(arguments)
+        state = "completed" if data.get("ok") else "failed"
+        return (state, data)
+    return (
+        "failed",
+        {
+            "ok": False,
+            "error": "unknown_skill",
+            "message": f"Unknown skill '{skill}'.",
+            "available_skills": A2A_SKILLS_SUMMARY,
+        },
+    )
+
+
+def _a2a_extract_skill_call(message: dict) -> tuple:
+    """From an A2A message, extract (skill, arguments) or (None, None).
+
+    Prefers a `data` part with {"skill": ..., "arguments": {...}}. Falls back
+    to inspecting a `text` part (returns skill=None so the caller can emit a
+    helpful error).
+    """
+    parts = (message or {}).get("parts") or []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "data" and isinstance(part.get("data"), dict):
+            d = part["data"]
+            skill = d.get("skill")
+            arguments = d.get("arguments") or {}
+            if skill:
+                return (skill, arguments)
+    # No structured data part -- return the first text (for a NL fallback).
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "text":
+            return (None, {"_text": part.get("text", "")})
+    return (None, None)
+
+
+def _handle_a2a_rpc(message: dict) -> Optional[dict]:
+    """Handle a single A2A JSON-RPC 2.0 message."""
+    msg_id = message.get("id")
+    method = message.get("method")
+    params = message.get("params") or {}
+    auth_header = message.get("_auth_header")  # injected by the endpoint
+
+    if method in ("tasks/send", "message/send"):
+        task_id = params.get("id") or params.get("taskId")
+        msg = params.get("message") or {}
+        skill, arguments = _a2a_extract_skill_call(msg)
+
+        if skill is None:
+            # Natural-language / no structured skill call -- return a helpful
+            # error listing the available skills.
+            help_data = {
+                "ok": False,
+                "error": "no_skill_specified",
+                "message": (
+                    "No skill was specified. Send a message with a 'data' part: "
+                    '{"skill": "<register|find_agents|verify_credential>", '
+                    '"arguments": {...}}.'
+                ),
+                "available_skills": A2A_SKILLS_SUMMARY,
+            }
+            if arguments and arguments.get("_text"):
+                help_data["received_text"] = arguments.get("_text")
+            return _rpc_result(
+                msg_id, _a2a_task_result(task_id, "failed", data=help_data)
+            )
+
+        state, data = _a2a_dispatch_skill(skill, arguments, auth_header)
+        return _rpc_result(msg_id, _a2a_task_result(task_id, state, data=data))
+
+    if method == "tasks/get":
+        # We don't persist task history in this version.
+        return _rpc_error(
+            msg_id, -32001,
+            "Task history is not persisted in this version of the Build Guild A2A agent."
+        )
+
+    if method == "tasks/cancel":
+        task_id = params.get("id") or params.get("taskId")
+        return _rpc_result(
+            msg_id, _a2a_task_result(task_id, "canceled",
+                                     data={"ok": True, "message": "Task canceled."})
+        )
+
+    if method == "agent/authenticatedExtendedCard":
+        return _rpc_result(msg_id, AGENT_CARD)
+
+    return _rpc_error(msg_id, -32601, f"Method not found: {method}")
+
+
+@app.get("/.well-known/agent.json")
+async def well_known_agent_card():
+    """A2A Agent Card (Google A2A spec)."""
+    return JSONResponse(content=AGENT_CARD)
+
+
+@app.post("/a2a")
+async def a2a_endpoint(request: Request):
+    """A2A JSON-RPC 2.0 endpoint for The Build Guild."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            _rpc_error(None, -32700, "Parse error: invalid JSON"), status_code=400
+        )
+
+    auth_header = request.headers.get("authorization")
+
+    if isinstance(payload, list):
+        for m in payload:
+            if isinstance(m, dict):
+                m["_auth_header"] = auth_header
+        responses = [r for r in (_handle_a2a_rpc(m) for m in payload if isinstance(m, dict)) if r is not None]
+        return JSONResponse(content=responses)
+
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            _rpc_error(None, -32600, "Invalid Request"), status_code=400
+        )
+
+    payload["_auth_header"] = auth_header
+    response = _handle_a2a_rpc(payload)
+    if response is None:
+        return JSONResponse(content=None, status_code=202)
+    return JSONResponse(content=response)
+
+
+# ---------------------------------------------------------------------------
+# Startup: attempt the a2a_endpoint column migration (best-effort)
+# ---------------------------------------------------------------------------
+
+_A2A_MIGRATION_SQL = (
+    "ALTER TABLE public.guild_members ADD COLUMN IF NOT EXISTS a2a_endpoint TEXT;"
+)
+
+
+def _run_a2a_migration() -> None:
+    """Best-effort: add the a2a_endpoint column via the Supabase Management API.
+
+    PostgREST (anon key) cannot run DDL, so this uses the Supabase Management
+    API when SUPABASE_SERVICE_ROLE_KEY + SUPABASE_PROJECT_REF are available.
+    If neither works, we log the SQL to run manually -- the code paths above
+    all tolerate the column being absent.
+    """
+    project_ref = os.environ.get("SUPABASE_PROJECT_REF")
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    mgmt_token = os.environ.get("SUPABASE_ACCESS_TOKEN")
+
+    # Route 1: Supabase Management API (requires a personal access token).
+    if project_ref and mgmt_token:
+        try:
+            import urllib.request
+
+            url = f"https://api.supabase.com/v1/projects/{project_ref}/database/query"
+            body = json.dumps({"query": _A2A_MIGRATION_SQL}).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={
+                    "Authorization": f"Bearer {mgmt_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status in (200, 201):
+                    _guild_logger.info(
+                        "A2A migration applied via Supabase Management API."
+                    )
+                    return
+        except Exception as exc:
+            _guild_logger.warning(
+                "A2A migration via Management API failed: %s", exc
+            )
+
+    # Route 2: PostgREST RPC 'exec_sql' if the project happens to expose one.
+    if service_key and os.environ.get("SUPABASE_URL"):
+        try:
+            import urllib.request
+
+            url = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1/rpc/exec_sql"
+            body = json.dumps({"sql": _A2A_MIGRATION_SQL}).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={
+                    "apikey": service_key,
+                    "Authorization": f"Bearer {service_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status in (200, 201, 204):
+                    _guild_logger.info("A2A migration applied via exec_sql RPC.")
+                    return
+        except Exception as exc:
+            _guild_logger.warning("A2A migration via exec_sql RPC failed: %s", exc)
+
+    # Fallback: log the SQL to run manually. Column-absent is handled gracefully.
+    _guild_logger.warning(
+        "A2A migration NOT applied automatically. Run this SQL manually in the "
+        "Supabase SQL editor:\n    %s", _A2A_MIGRATION_SQL
+    )
+
+
+@app.on_event("startup")
+async def _a2a_startup():
+    try:
+        _run_a2a_migration()
+    except Exception as exc:  # never let migration crash startup
+        _guild_logger.warning("A2A startup migration skipped: %s", exc)
