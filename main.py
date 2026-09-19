@@ -573,7 +573,18 @@ admin@zeroeng.io
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return PAGE
+    # The Build Guild is now the site's landing page. The former
+    # "AI-Native Geospatial Intelligence" page (PAGE) has been deprecated and
+    # is no longer surfaced; legacy geospatial URLs redirect here (see below).
+    return BUILD_GUILD_PAGE
+
+
+# Legacy redirects for the deprecated geospatial landing page. Any old links
+# pointing at the former home page now land on the Build Guild.
+@app.get("/geospatial")
+@app.get("/ai-native-geospatial-intelligence")
+async def geospatial_deprecated():
+    return RedirectResponse("/", status_code=301)
 
 
 @app.get("/llms.txt", response_class=PlainTextResponse)
@@ -2326,7 +2337,7 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
 
 <nav>
   <div class="wrap nav-inner">
-    <a class="back" href="/">&larr; Zero Engineering</a>
+    <a class="back" href="/">Zero Engineering</a>
     <span class="nav-name">The Build Guild</span>
     <div class="nav-right"><a class="nav-link" href="/build-guild/login">Log in</a><a class="nav-link nav-join" href="/build-guild/signup">Join the Guild</a></div>
   </div>
