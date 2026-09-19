@@ -2594,14 +2594,14 @@ def _bg_esc(value: Any) -> str:
 
 _BG_PORTAL_CSS = """
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--amber:#f0a500;--bg:#0e0c09;--panel:#1a1610;--panel-hi:#221d15;
---border:#2c261c;--border-hi:#3a3223;--muted:#9a8f7a;--faint:#6b6152;--text:#efe7d6}
+:root{--amber:#ffffff;--bg:#000000;--panel:#111111;--panel-hi:#181818;
+--border:#1f1f1f;--border-hi:#2a2a2a;--muted:#888888;--faint:#444444;--text:#ffffff}
 body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,-apple-system,sans-serif;
-line-height:1.55;min-height:100vh;-webkit-font-smoothing:antialiased}
+line-height:1.55;min-height:100vh;-webkit-font-smoothing:antialiased;border-top:2px solid #ffffff}
 a{color:var(--amber);text-decoration:none}
 .wrap{max-width:960px;margin:0 auto;padding:0 1.4rem}
 .narrow{max-width:440px}
-nav{border-bottom:1px solid var(--border);background:rgba(14,12,9,.9);position:sticky;top:0;z-index:20;backdrop-filter:blur(8px)}
+nav{border-bottom:1px solid var(--border);background:rgba(0,0,0,.92);position:sticky;top:0;z-index:20;backdrop-filter:blur(8px)}
 .nav-inner{display:flex;align-items:center;justify-content:space-between;height:62px;gap:1rem}
 .brand{font-weight:700;letter-spacing:.16em;font-size:.8rem;text-transform:uppercase;color:var(--amber)}
 .nav-links{display:flex;gap:1.1rem;align-items:center;font-size:.82rem}
@@ -2618,13 +2618,13 @@ textarea{min-height:96px;resize:vertical}
 .btn{display:inline-block;border:1px solid var(--border-hi);background:transparent;color:var(--text);
 font:inherit;font-weight:600;font-size:.92rem;padding:.8rem 1.4rem;border-radius:9px;cursor:pointer;transition:all .15s;width:100%}
 .btn:hover{border-color:var(--amber);color:var(--amber)}
-.btn.primary{background:var(--amber);color:#1a1200;border-color:var(--amber)}
-.btn.primary:hover{filter:brightness(1.08);color:#1a1200}
+.btn.primary{background:var(--amber);color:#000000;border-color:var(--amber)}
+.btn.primary:hover{filter:brightness(1.08);color:#000000}
 .btn.sm{width:auto;padding:.55rem 1rem;font-size:.85rem}
 .row{display:flex;gap:.8rem;flex-wrap:wrap;align-items:center}
 .msg{border-radius:9px;padding:.8rem 1rem;font-size:.9rem;margin-bottom:1.2rem}
 .msg.err{background:rgba(220,60,60,.1);border:1px solid rgba(220,60,60,.4);color:#f0a0a0}
-.msg.ok{background:rgba(240,165,0,.08);border:1px solid rgba(240,165,0,.35);color:var(--amber)}
+.msg.ok{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.25);color:var(--amber)}
 .foot{margin-top:1.4rem;font-size:.85rem;color:var(--muted);text-align:center}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1rem;margin-top:1.2rem}
 .proj{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:1.3rem;transition:border-color .15s}
@@ -2687,14 +2687,9 @@ def _bg_auth_form(kind: str, error: str = "", email: str = "") -> str:
         if is_signup
         else '<p class="foot">New here? <a href="/build-guild/signup">Join the Guild</a></p>'
     )
-    name_field = (
-        '<label for="display_name">Name</label>'
-        '<input id="display_name" name="display_name" type="text" autocomplete="name" required>'
-        '<label for="org_name">Organization <span style="text-transform:none;color:var(--faint)">(optional)</span></label>'
-        '<input id="org_name" name="org_name" type="text" autocomplete="organization">'
-        if is_signup
-        else ""
-    )
+    # Signup asks for email + password only. Name/organization are no longer
+    # collected here; the profile display name defaults to the email prefix.
+    name_field = ""
     err = f'<div class="msg err">{_bg_esc(error)}</div>' if error else ""
     body = (
         '<div class="wrap narrow" style="padding-top:3rem;padding-bottom:3rem">'
