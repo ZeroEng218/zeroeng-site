@@ -14,17 +14,24 @@ Run locally:
 """
 
 import datetime
+import hashlib
 import json
 import logging
 import math
 import os
+import secrets as secrets_mod
 from typing import Any, Optional
 
 from jose import jwt
 
-from fastapi import FastAPI, Request
+from fastapi import Cookie, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 
 app = FastAPI(title="Zero Engineering")
 
@@ -2223,7 +2230,11 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
         .back { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; color: var(--muted); transition: color 0.15s; flex: 1; }
         .back:hover { color: var(--amber); }
         .nav-name { font-weight: 700; letter-spacing: 0.18em; font-size: 0.82rem; text-transform: uppercase; color: var(--amber); text-align: center; }
-        .nav-right { flex: 1; display: flex; justify-content: flex-end; }
+        .nav-right { flex: 1; display: flex; justify-content: flex-end; align-items: center; gap: 0.9rem; }
+        .nav-link { font-size: 0.8rem; font-weight: 600; color: var(--muted); transition: color 0.15s; white-space: nowrap; }
+        .nav-link:hover { color: var(--amber); }
+        .nav-join { color: var(--amber); border: 1px solid var(--amber); border-radius: 999px; padding: 0.35rem 0.85rem; }
+        .nav-join:hover { background: var(--amber); color: #1a1200; }
         .pill { font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--amber); border: 1px solid var(--amber); border-radius: 999px; padding: 0.35rem 0.85rem; white-space: nowrap; }
         @media (max-width: 620px){ .nav-name { display:none; } }
 
@@ -2317,7 +2328,7 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
   <div class="wrap nav-inner">
     <a class="back" href="/">&larr; Zero Engineering</a>
     <span class="nav-name">The Build Guild</span>
-    <div class="nav-right"><span class="pill">Early Access</span></div>
+    <div class="nav-right"><a class="nav-link" href="/build-guild/login">Log in</a><a class="nav-link nav-join" href="/build-guild/signup">Join the Guild</a></div>
   </div>
 </nav>
 
@@ -2467,6 +2478,847 @@ async def well_known_agent_manifest():
 @app.get("/build-guild", response_class=HTMLResponse)
 async def build_guild():
     return BUILD_GUILD_PAGE
+
+
+# ===========================================================================
+# Build Guild — human-facing authenticated portal (Supabase Auth)
+# ---------------------------------------------------------------------------
+# Email/password auth with email verification. Session is stored in an
+# httponly cookie ("bg_session") holding the Supabase access token. All data
+# access is mediated server-side (see build_guild_supabase_setup.md for the
+# user_profiles / projects / project_members schema in the active Supabase
+# project: mbajrhfzsiuzsrbxmjti).
+# ===========================================================================
+
+_BG_COOKIE = "bg_session"
+_BG_COOKIE_MAXAGE = 60 * 60 * 24 * 7  # 7 days
+
+
+def _bg_base_url(request: Request) -> str:
+    """Public base URL for building email redirect links."""
+    env = os.environ.get("PUBLIC_BASE_URL")
+    if env:
+        return env.rstrip("/")
+    base = str(request.base_url).rstrip("/")
+    # Railway terminates TLS at the proxy; prefer https for the public host.
+    if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
+        base = "https://" + base[len("http://"):]
+    return base
+
+
+def _bg_set_session_cookie(resp, access_token: str) -> None:
+    resp.set_cookie(
+        _BG_COOKIE,
+        access_token,
+        max_age=_BG_COOKIE_MAXAGE,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _bg_clear_session_cookie(resp) -> None:
+    resp.delete_cookie(_BG_COOKIE, path="/")
+
+
+def _bg_get_current_user(bg_session: Optional[str]) -> Optional[dict]:
+    """Return {'id', 'email'} for the logged-in user, or None."""
+    if not bg_session:
+        return None
+    client = get_supabase()
+    if client is None:
+        return None
+    try:
+        res = client.auth.get_user(bg_session)
+    except Exception:
+        return None
+    user = getattr(res, "user", None)
+    if user is None:
+        return None
+    uid = getattr(user, "id", None)
+    email = getattr(user, "email", None)
+    if not uid:
+        return None
+    return {"id": uid, "email": email}
+
+
+def _bg_ensure_profile(client, user: dict) -> dict:
+    """Fetch (creating if missing) the user_profiles row for this user."""
+    try:
+        res = (
+            client.table("user_profiles")
+            .select("id, email, display_name, org_name, role")
+            .eq("id", user["id"])
+            .limit(1)
+            .execute()
+        )
+        row = res.data[0] if res and res.data else None
+    except Exception:
+        row = None
+    if row:
+        return row
+    profile = {
+        "id": user["id"],
+        "email": user.get("email"),
+        "display_name": (user.get("email") or "").split("@")[0] or "Member",
+    }
+    try:
+        client.table("user_profiles").insert(profile).execute()
+    except Exception:
+        pass
+    return profile
+
+
+def _bg_esc(value: Any) -> str:
+    """Minimal HTML escaping for user-supplied text."""
+    if value is None:
+        return ""
+    s = str(value)
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+_BG_PORTAL_CSS = """
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--amber:#f0a500;--bg:#0e0c09;--panel:#1a1610;--panel-hi:#221d15;
+--border:#2c261c;--border-hi:#3a3223;--muted:#9a8f7a;--faint:#6b6152;--text:#efe7d6}
+body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,-apple-system,sans-serif;
+line-height:1.55;min-height:100vh;-webkit-font-smoothing:antialiased}
+a{color:var(--amber);text-decoration:none}
+.wrap{max-width:960px;margin:0 auto;padding:0 1.4rem}
+.narrow{max-width:440px}
+nav{border-bottom:1px solid var(--border);background:rgba(14,12,9,.9);position:sticky;top:0;z-index:20;backdrop-filter:blur(8px)}
+.nav-inner{display:flex;align-items:center;justify-content:space-between;height:62px;gap:1rem}
+.brand{font-weight:700;letter-spacing:.16em;font-size:.8rem;text-transform:uppercase;color:var(--amber)}
+.nav-links{display:flex;gap:1.1rem;align-items:center;font-size:.82rem}
+.nav-links a{color:var(--muted)}.nav-links a:hover{color:var(--amber)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:2rem}
+h1{font-size:1.7rem;font-weight:700;letter-spacing:-.01em;margin-bottom:.4rem}
+h2{font-size:1.15rem;font-weight:600;margin-bottom:.9rem}
+.sub{color:var(--muted);font-size:.92rem;margin-bottom:1.6rem}
+label{display:block;font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:1rem 0 .35rem}
+input,textarea,select{width:100%;background:var(--bg);border:1px solid var(--border-hi);border-radius:9px;
+color:var(--text);font:inherit;font-size:.95rem;padding:.75rem .9rem}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--amber)}
+textarea{min-height:96px;resize:vertical}
+.btn{display:inline-block;border:1px solid var(--border-hi);background:transparent;color:var(--text);
+font:inherit;font-weight:600;font-size:.92rem;padding:.8rem 1.4rem;border-radius:9px;cursor:pointer;transition:all .15s;width:100%}
+.btn:hover{border-color:var(--amber);color:var(--amber)}
+.btn.primary{background:var(--amber);color:#1a1200;border-color:var(--amber)}
+.btn.primary:hover{filter:brightness(1.08);color:#1a1200}
+.btn.sm{width:auto;padding:.55rem 1rem;font-size:.85rem}
+.row{display:flex;gap:.8rem;flex-wrap:wrap;align-items:center}
+.msg{border-radius:9px;padding:.8rem 1rem;font-size:.9rem;margin-bottom:1.2rem}
+.msg.err{background:rgba(220,60,60,.1);border:1px solid rgba(220,60,60,.4);color:#f0a0a0}
+.msg.ok{background:rgba(240,165,0,.08);border:1px solid rgba(240,165,0,.35);color:var(--amber)}
+.foot{margin-top:1.4rem;font-size:.85rem;color:var(--muted);text-align:center}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1rem;margin-top:1.2rem}
+.proj{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:1.3rem;transition:border-color .15s}
+.proj:hover{border-color:var(--amber)}
+.proj h3{font-size:1.05rem;margin-bottom:.3rem;color:var(--text)}
+.proj p{color:var(--muted);font-size:.86rem}
+.tag{display:inline-block;font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--amber);
+border:1px solid var(--border-hi);border-radius:999px;padding:.2rem .6rem;margin-top:.7rem}
+.empty{border:1px dashed var(--border-hi);border-radius:12px;padding:2.4rem;text-align:center;color:var(--muted);margin-top:1.2rem}
+table{width:100%;border-collapse:collapse;margin-top:.6rem}
+th,td{text-align:left;padding:.6rem .5rem;border-bottom:1px solid var(--border);font-size:.9rem}
+th{color:var(--faint);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}
+.pagehead{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;margin:2rem 0 .5rem}
+.section{margin-top:2rem}
+.backlink{font-size:.84rem;color:var(--muted)}
+"""
+
+
+def _bg_shell(title: str, body: str, user: Optional[dict] = None) -> str:
+    if user:
+        nav_links = (
+            '<a href="/build-guild/dashboard">Dashboard</a>'
+            '<a href="/build-guild/logout">Log out</a>'
+        )
+    else:
+        nav_links = (
+            '<a href="/build-guild/login">Log in</a>'
+            '<a href="/build-guild/signup">Join</a>'
+        )
+    return (
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+        f"<title>{_bg_esc(title)} — The Build Guild</title>"
+        "<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">"
+        "<link href=\"https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap\" rel=\"stylesheet\">"
+        f"<style>{_BG_PORTAL_CSS}</style></head><body>"
+        "<nav><div class=\"wrap nav-inner\">"
+        "<a class=\"brand\" href=\"/build-guild\">The Build Guild</a>"
+        f"<div class=\"nav-links\">{nav_links}</div>"
+        "</div></nav>"
+        f"{body}"
+        "</body></html>"
+    )
+
+
+# ── Signup ─────────────────────────────────────────────────────────────────
+
+def _bg_auth_form(kind: str, error: str = "", email: str = "") -> str:
+    is_signup = kind == "signup"
+    title = "Join the Build Guild" if is_signup else "Log in"
+    sub = (
+        "Create an account to register projects and connect with credentialed agents."
+        if is_signup
+        else "Welcome back. Log in to your Build Guild workspace."
+    )
+    action = "/build-guild/signup" if is_signup else "/build-guild/login"
+    submit = "Create account" if is_signup else "Log in"
+    alt = (
+        '<p class="foot">Already a member? <a href="/build-guild/login">Log in</a></p>'
+        if is_signup
+        else '<p class="foot">New here? <a href="/build-guild/signup">Join the Guild</a></p>'
+    )
+    name_field = (
+        '<label for="display_name">Name</label>'
+        '<input id="display_name" name="display_name" type="text" autocomplete="name" required>'
+        '<label for="org_name">Organization <span style="text-transform:none;color:var(--faint)">(optional)</span></label>'
+        '<input id="org_name" name="org_name" type="text" autocomplete="organization">'
+        if is_signup
+        else ""
+    )
+    err = f'<div class="msg err">{_bg_esc(error)}</div>' if error else ""
+    body = (
+        '<div class="wrap narrow" style="padding-top:3rem;padding-bottom:3rem">'
+        '<div class="card">'
+        f"<h1>{title}</h1><p class=\"sub\">{sub}</p>{err}"
+        f'<form method="post" action="{action}">'
+        '<label for="email">Email</label>'
+        f'<input id="email" name="email" type="email" autocomplete="email" value="{_bg_esc(email)}" required>'
+        f"{name_field}"
+        '<label for="password">Password</label>'
+        '<input id="password" name="password" type="password" autocomplete="'
+        + ("new-password" if is_signup else "current-password")
+        + '" minlength="8" required>'
+        f'<div style="height:1.4rem"></div><button class="btn primary" type="submit">{submit}</button>'
+        "</form>"
+        f"{alt}"
+        "</div></div>"
+    )
+    return _bg_shell(title, body)
+
+
+@app.get("/build-guild/signup", response_class=HTMLResponse)
+async def bg_signup_page(bg_session: Optional[str] = Cookie(default=None)):
+    if _bg_get_current_user(bg_session):
+        return RedirectResponse("/build-guild/dashboard", status_code=303)
+    return HTMLResponse(_bg_auth_form("signup"))
+
+
+@app.post("/build-guild/signup", response_class=HTMLResponse)
+async def bg_signup_submit(request: Request):
+    form = await request.form()
+    email = (form.get("email") or "").strip()
+    password = form.get("password") or ""
+    display_name = (form.get("display_name") or "").strip()
+    org_name = (form.get("org_name") or "").strip()
+
+    if not email or not password:
+        return HTMLResponse(_bg_auth_form("signup", "Email and password are required.", email))
+    if len(password) < 8:
+        return HTMLResponse(
+            _bg_auth_form("signup", "Password must be at least 8 characters.", email)
+        )
+
+    client = get_supabase()
+    if client is None:
+        return HTMLResponse(
+            _bg_auth_form("signup", "Authentication is not configured on this server.", email)
+        )
+
+    redirect_to = _bg_base_url(request) + "/build-guild/verify"
+    try:
+        res = client.auth.sign_up(
+            {
+                "email": email,
+                "password": password,
+                "options": {
+                    "email_redirect_to": redirect_to,
+                    "data": {"display_name": display_name, "org_name": org_name},
+                },
+            }
+        )
+    except Exception as exc:
+        return HTMLResponse(
+            _bg_auth_form("signup", f"Could not create account: {exc}", email)
+        )
+
+    user = getattr(res, "user", None)
+    session = getattr(res, "session", None)
+
+    # Best-effort: seed a profile row now so it exists on first login.
+    if user is not None and getattr(user, "id", None):
+        try:
+            client.table("user_profiles").upsert(
+                {
+                    "id": user.id,
+                    "email": email,
+                    "display_name": display_name or email.split("@")[0],
+                    "org_name": org_name or None,
+                }
+            ).execute()
+        except Exception:
+            pass
+
+    # If email confirmation is disabled, a session is returned immediately.
+    if session is not None and getattr(session, "access_token", None):
+        resp = RedirectResponse("/build-guild/dashboard", status_code=303)
+        _bg_set_session_cookie(resp, session.access_token)
+        return resp
+
+    body = (
+        '<div class="wrap narrow" style="padding-top:3rem;padding-bottom:3rem">'
+        '<div class="card">'
+        "<h1>Check your email</h1>"
+        f'<p class="sub">We sent a verification link to <strong>{_bg_esc(email)}</strong>. '
+        "Click it to activate your account, then log in.</p>"
+        '<a class="btn primary" href="/build-guild/login">Go to log in</a>'
+        "</div></div>"
+    )
+    return HTMLResponse(_bg_shell("Check your email", body))
+
+
+# ── Login / Logout ───────────────────────────────────────────────────────
+
+@app.get("/build-guild/login", response_class=HTMLResponse)
+async def bg_login_page(bg_session: Optional[str] = Cookie(default=None)):
+    if _bg_get_current_user(bg_session):
+        return RedirectResponse("/build-guild/dashboard", status_code=303)
+    return HTMLResponse(_bg_auth_form("login"))
+
+
+@app.post("/build-guild/login", response_class=HTMLResponse)
+async def bg_login_submit(request: Request):
+    form = await request.form()
+    email = (form.get("email") or "").strip()
+    password = form.get("password") or ""
+
+    if not email or not password:
+        return HTMLResponse(_bg_auth_form("login", "Email and password are required.", email))
+
+    client = get_supabase()
+    if client is None:
+        return HTMLResponse(
+            _bg_auth_form("login", "Authentication is not configured on this server.", email)
+        )
+
+    try:
+        res = client.auth.sign_in_with_password({"email": email, "password": password})
+    except Exception as exc:
+        msg = str(exc)
+        if "Email not confirmed" in msg:
+            msg = "Please verify your email before logging in (check your inbox)."
+        elif "Invalid login" in msg or "invalid" in msg.lower():
+            msg = "Invalid email or password."
+        return HTMLResponse(_bg_auth_form("login", msg, email))
+
+    session = getattr(res, "session", None)
+    if session is None or not getattr(session, "access_token", None):
+        return HTMLResponse(_bg_auth_form("login", "Login failed. Please try again.", email))
+
+    resp = RedirectResponse("/build-guild/dashboard", status_code=303)
+    _bg_set_session_cookie(resp, session.access_token)
+    return resp
+
+
+@app.get("/build-guild/logout")
+async def bg_logout():
+    resp = RedirectResponse("/build-guild", status_code=303)
+    _bg_clear_session_cookie(resp)
+    return resp
+
+
+# ── Email verification ─────────────────────────────────────────────────────
+
+@app.get("/build-guild/verify", response_class=HTMLResponse)
+async def bg_verify(
+    request: Request,
+    token_hash: Optional[str] = None,
+    type: Optional[str] = None,
+):
+    client = get_supabase()
+    # Server-side OTP flow (when email template uses {{ .TokenHash }}).
+    if client is not None and token_hash:
+        try:
+            res = client.auth.verify_otp(
+                {"token_hash": token_hash, "type": type or "email"}
+            )
+            session = getattr(res, "session", None)
+            if session is not None and getattr(session, "access_token", None):
+                resp = RedirectResponse("/build-guild/dashboard", status_code=303)
+                _bg_set_session_cookie(resp, session.access_token)
+                return resp
+        except Exception as exc:
+            body = (
+                '<div class="wrap narrow" style="padding-top:3rem"><div class="card">'
+                "<h1>Verification failed</h1>"
+                f'<p class="sub">{_bg_esc(exc)}</p>'
+                '<a class="btn primary" href="/build-guild/login">Go to log in</a>'
+                "</div></div>"
+            )
+            return HTMLResponse(_bg_shell("Verification failed", body))
+
+    # Fallback: implicit flow returns tokens in the URL fragment (client-side).
+    body = (
+        '<div class="wrap narrow" style="padding-top:3rem"><div class="card">'
+        '<h1>Verifying…</h1>'
+        '<p class="sub" id="bgv">Finishing up, one moment.</p>'
+        '<a class="btn primary" href="/build-guild/login">Go to log in</a>'
+        "</div></div>"
+        "<script>(function(){"
+        "var h=window.location.hash.replace(/^#/,'');"
+        "if(!h){return;}"
+        "var p=new URLSearchParams(h);var t=p.get('access_token');"
+        "if(!t){return;}"
+        "fetch('/build-guild/set-session',{method:'POST',headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({access_token:t})}).then(function(r){"
+        "if(r.ok){window.location.replace('/build-guild/dashboard');}"
+        "else{document.getElementById('bgv').textContent='Verification link expired. Please log in.';}"
+        "});})();</script>"
+    )
+    return HTMLResponse(_bg_shell("Verifying", body))
+
+
+@app.post("/build-guild/set-session")
+async def bg_set_session(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
+    token = (data or {}).get("access_token")
+    if not token:
+        return JSONResponse({"ok": False, "error": "missing_token"}, status_code=400)
+    user = _bg_get_current_user(token)
+    if not user:
+        return JSONResponse({"ok": False, "error": "invalid_token"}, status_code=401)
+    resp = JSONResponse({"ok": True})
+    _bg_set_session_cookie(resp, token)
+    return resp
+
+
+# ── Dashboard ───────────────────────────────────────────────────────────────
+
+def _bg_user_projects(client, user_id: str) -> list:
+    """Return projects the user owns or is a member of."""
+    projects = {}
+    try:
+        owned = (
+            client.table("projects")
+            .select("id, name, description, location, owner_id, created_at")
+            .eq("owner_id", user_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        for p in (owned.data or []):
+            projects[p["id"]] = dict(p, _role="Owner")
+    except Exception:
+        pass
+    try:
+        memberships = (
+            client.table("project_members")
+            .select("project_id, role")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        member_ids = [
+            m["project_id"] for m in (memberships.data or [])
+            if m.get("project_id") and m["project_id"] not in projects
+        ]
+        if member_ids:
+            rows = (
+                client.table("projects")
+                .select("id, name, description, location, owner_id, created_at")
+                .in_("id", member_ids)
+                .execute()
+            )
+            role_by_id = {m["project_id"]: m.get("role") for m in (memberships.data or [])}
+            for p in (rows.data or []):
+                projects[p["id"]] = dict(p, _role=role_by_id.get(p["id"]) or "Member")
+    except Exception:
+        pass
+    out = list(projects.values())
+    out.sort(key=lambda p: p.get("created_at") or "", reverse=True)
+    return out
+
+
+@app.get("/build-guild/dashboard", response_class=HTMLResponse)
+async def bg_dashboard(bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    profile = _bg_ensure_profile(client, user)
+    projects = _bg_user_projects(client, user["id"])
+
+    name = profile.get("display_name") or user.get("email") or "Member"
+    if projects:
+        cards = []
+        for p in projects:
+            desc = _bg_esc(p.get("description") or "No description yet.")
+            loc = p.get("location")
+            loc_html = f'<div class="tag">{_bg_esc(loc)}</div>' if loc else ""
+            cards.append(
+                f'<a class="proj" href="/build-guild/project/{_bg_esc(p["id"])}">'
+                f'<h3>{_bg_esc(p.get("name") or "Untitled project")}</h3>'
+                f"<p>{desc}</p>"
+                f'<div class="tag">{_bg_esc(p.get("_role") or "Member")}</div>{loc_html}'
+                "</a>"
+            )
+        projects_html = f'<div class="grid">{"".join(cards)}</div>'
+    else:
+        projects_html = (
+            '<div class="empty">You have no projects yet.<br>'
+            'Create your first project to start collaborating with credentialed agents and members.</div>'
+        )
+
+    body = (
+        '<div class="wrap" style="padding-bottom:4rem">'
+        '<div class="pagehead">'
+        f"<div><h1>Welcome, {_bg_esc(name)}</h1>"
+        '<p class="sub" style="margin-bottom:0">Your Build Guild projects</p></div>'
+        '<a class="btn primary sm" href="/build-guild/projects/new">+ New project</a>'
+        "</div>"
+        f"{projects_html}"
+        "</div>"
+    )
+    return HTMLResponse(_bg_shell("Dashboard", body, user))
+
+
+# ── New project ─────────────────────────────────────────────────────────────
+
+def _bg_new_project_form(error: str = "", values: Optional[dict] = None,
+                         user: Optional[dict] = None) -> str:
+    v = values or {}
+    err = f'<div class="msg err">{_bg_esc(error)}</div>' if error else ""
+    body = (
+        '<div class="wrap narrow" style="padding-top:2.4rem;padding-bottom:3rem">'
+        '<a class="backlink" href="/build-guild/dashboard">&larr; Back to dashboard</a>'
+        '<div class="card" style="margin-top:1rem">'
+        "<h1>New project</h1>"
+        '<p class="sub">Create a project workspace. You become its owner and can invite members.</p>'
+        f"{err}"
+        '<form method="post" action="/build-guild/projects/new">'
+        '<label for="name">Project name</label>'
+        f'<input id="name" name="name" type="text" value="{_bg_esc(v.get("name",""))}" required>'
+        '<label for="location">Location <span style="text-transform:none;color:var(--faint)">(optional)</span></label>'
+        f'<input id="location" name="location" type="text" placeholder="e.g. Austin, TX" value="{_bg_esc(v.get("location",""))}">'
+        '<label for="description">Description <span style="text-transform:none;color:var(--faint)">(optional)</span></label>'
+        f'<textarea id="description" name="description">{_bg_esc(v.get("description",""))}</textarea>'
+        '<div style="height:1.4rem"></div>'
+        '<button class="btn primary" type="submit">Create project</button>'
+        "</form></div></div>"
+    )
+    return _bg_shell("New project", body, user)
+
+
+@app.get("/build-guild/projects/new", response_class=HTMLResponse)
+async def bg_new_project_page(bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    return HTMLResponse(_bg_new_project_form(user=user))
+
+
+@app.post("/build-guild/projects/new", response_class=HTMLResponse)
+async def bg_new_project_submit(request: Request,
+                                bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    location = (form.get("location") or "").strip()
+    description = (form.get("description") or "").strip()
+    values = {"name": name, "location": location, "description": description}
+
+    if not name:
+        return HTMLResponse(
+            _bg_new_project_form("Project name is required.", values, user)
+        )
+
+    client = get_supabase()
+    if client is None:
+        return HTMLResponse(
+            _bg_new_project_form("Database is not configured on this server.", values, user)
+        )
+
+    _bg_ensure_profile(client, user)
+    try:
+        res = (
+            client.table("projects")
+            .insert(
+                {
+                    "name": name,
+                    "location": location or None,
+                    "description": description or None,
+                    "owner_id": user["id"],
+                }
+            )
+            .execute()
+        )
+        row = res.data[0] if res and res.data else None
+    except Exception as exc:
+        return HTMLResponse(
+            _bg_new_project_form(f"Could not create project: {exc}", values, user)
+        )
+
+    if not row:
+        return HTMLResponse(
+            _bg_new_project_form("Could not create project. Please try again.", values, user)
+        )
+
+    # Record the owner as a member too.
+    try:
+        client.table("project_members").insert(
+            {
+                "project_id": row["id"],
+                "user_id": user["id"],
+                "email": user.get("email"),
+                "role": "Owner",
+                "status": "active",
+            }
+        ).execute()
+    except Exception:
+        pass
+
+    return RedirectResponse(f"/build-guild/project/{row['id']}", status_code=303)
+
+
+# ── Project detail ─────────────────────────────────────────────────────────
+
+@app.get("/build-guild/project/{project_id}", response_class=HTMLResponse)
+async def bg_project_detail(project_id: str,
+                            invited: Optional[str] = None,
+                            err: Optional[str] = None,
+                            bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    if client is None:
+        return HTMLResponse(_bg_shell(
+            "Unavailable",
+            '<div class="wrap" style="padding-top:3rem"><div class="card">'
+            "<h1>Unavailable</h1><p class=\"sub\">Database is not configured.</p></div></div>",
+            user,
+        ))
+
+    try:
+        pres = (
+            client.table("projects")
+            .select("id, name, description, location, owner_id, created_at")
+            .eq("id", project_id)
+            .limit(1)
+            .execute()
+        )
+        project = pres.data[0] if pres and pres.data else None
+    except Exception:
+        project = None
+
+    if not project:
+        return HTMLResponse(_bg_shell(
+            "Not found",
+            '<div class="wrap" style="padding-top:3rem"><div class="card">'
+            "<h1>Project not found</h1>"
+            '<a class="btn primary" href="/build-guild/dashboard">Back to dashboard</a>'
+            "</div></div>",
+            user,
+        ), status_code=404)
+
+    # Load members and verify access.
+    try:
+        mres = (
+            client.table("project_members")
+            .select("email, role, status, user_id")
+            .eq("project_id", project_id)
+            .execute()
+        )
+        members = mres.data or []
+    except Exception:
+        members = []
+
+    is_owner = project.get("owner_id") == user["id"]
+    is_member = is_owner or any(m.get("user_id") == user["id"] for m in members)
+    if not is_member:
+        return HTMLResponse(_bg_shell(
+            "Access denied",
+            '<div class="wrap" style="padding-top:3rem"><div class="card">'
+            "<h1>Access denied</h1>"
+            '<p class="sub">You are not a member of this project.</p>'
+            '<a class="btn primary" href="/build-guild/dashboard">Back to dashboard</a>'
+            "</div></div>",
+            user,
+        ), status_code=403)
+
+    notice = ""
+    if invited:
+        notice = f'<div class="msg ok">Invitation sent to {_bg_esc(invited)}.</div>'
+    elif err:
+        notice = f'<div class="msg err">{_bg_esc(err)}</div>'
+
+    rows = []
+    for m in members:
+        rows.append(
+            "<tr>"
+            f"<td>{_bg_esc(m.get('email') or '—')}</td>"
+            f"<td>{_bg_esc(m.get('role') or 'Member')}</td>"
+            f"<td>{_bg_esc(m.get('status') or 'active')}</td>"
+            "</tr>"
+        )
+    members_table = (
+        "<table><thead><tr><th>Email</th><th>Role</th><th>Status</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+        if rows
+        else '<p class="sub">No members yet.</p>'
+    )
+
+    invite_form = ""
+    if is_owner:
+        invite_form = (
+            '<div class="section"><h2>Invite a member</h2>'
+            f'<form method="post" action="/build-guild/project/{_bg_esc(project_id)}/invite">'
+            '<div class="row" style="align-items:flex-end">'
+            '<div style="flex:1;min-width:200px">'
+            '<label for="invite_email">Email</label>'
+            '<input id="invite_email" name="email" type="email" required></div>'
+            '<div style="width:150px"><label for="invite_role">Role</label>'
+            '<select id="invite_role" name="role">'
+            '<option>Member</option><option>Architect</option><option>Engineer</option>'
+            '<option>Contractor</option><option>Vendor</option><option>Owner</option></select></div>'
+            '<button class="btn primary sm" type="submit" style="margin-bottom:1px">Send invite</button>'
+            "</div></form></div>"
+        )
+
+    loc = project.get("location")
+    loc_html = f'<div class="tag">{_bg_esc(loc)}</div>' if loc else ""
+    body = (
+        '<div class="wrap" style="padding-bottom:4rem">'
+        '<div style="padding-top:1.8rem">'
+        '<a class="backlink" href="/build-guild/dashboard">&larr; Back to dashboard</a></div>'
+        f"{notice}"
+        '<div class="pagehead" style="margin-top:1rem">'
+        f'<div><h1>{_bg_esc(project.get("name") or "Untitled project")}</h1>'
+        f'<p class="sub" style="margin-bottom:0">{_bg_esc(project.get("description") or "No description yet.")}</p>'
+        f"{loc_html}</div>"
+        f'<div class="tag">{"Owner" if is_owner else "Member"}</div>'
+        "</div>"
+        '<div class="section"><h2>Members</h2>'
+        f"{members_table}</div>"
+        f"{invite_form}"
+        "</div>"
+    )
+    return HTMLResponse(_bg_shell(project.get("name") or "Project", body, user))
+
+
+@app.post("/build-guild/project/{project_id}/invite")
+async def bg_project_invite(project_id: str, request: Request,
+                            bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    if client is None:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=Database+not+configured",
+            status_code=303,
+        )
+
+    form = await request.form()
+    email = (form.get("email") or "").strip().lower()
+    role = (form.get("role") or "Member").strip() or "Member"
+
+    # Verify caller owns the project.
+    try:
+        pres = (
+            client.table("projects")
+            .select("id, owner_id")
+            .eq("id", project_id)
+            .limit(1)
+            .execute()
+        )
+        project = pres.data[0] if pres and pres.data else None
+    except Exception:
+        project = None
+    if not project:
+        return RedirectResponse("/build-guild/dashboard", status_code=303)
+    if project.get("owner_id") != user["id"]:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=Only+the+owner+can+invite+members",
+            status_code=303,
+        )
+    if not email:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=Email+is+required",
+            status_code=303,
+        )
+
+    # Link to an existing user profile if one matches the email.
+    linked_user_id = None
+    try:
+        ures = (
+            client.table("user_profiles")
+            .select("id")
+            .eq("email", email)
+            .limit(1)
+            .execute()
+        )
+        prow = ures.data[0] if ures and ures.data else None
+        if prow:
+            linked_user_id = prow.get("id")
+    except Exception:
+        pass
+
+    # Avoid duplicate membership rows for the same email.
+    try:
+        existing = (
+            client.table("project_members")
+            .select("id")
+            .eq("project_id", project_id)
+            .eq("email", email)
+            .limit(1)
+            .execute()
+        )
+        already = existing.data[0] if existing and existing.data else None
+    except Exception:
+        already = None
+
+    if already:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=That+email+is+already+a+member",
+            status_code=303,
+        )
+
+    try:
+        client.table("project_members").insert(
+            {
+                "project_id": project_id,
+                "user_id": linked_user_id,
+                "email": email,
+                "role": role,
+                "status": "active" if linked_user_id else "invited",
+            }
+        ).execute()
+    except Exception as exc:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err={_bg_esc(str(exc))[:120]}",
+            status_code=303,
+        )
+
+    return RedirectResponse(
+        f"/build-guild/project/{project_id}?invited={email}",
+        status_code=303,
+    )
+
 
 
 
