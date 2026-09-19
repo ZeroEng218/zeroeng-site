@@ -20,6 +20,20 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
+## Invitation emails
+
+Clicking **Send invite** on a project page adds the member and emails them an
+invitation via [Resend](https://resend.com). Set these environment variables
+(e.g. in Railway) for emails to be sent:
+
+- `RESEND_API_KEY` -- your Resend API key (required). Without it the member is
+  still added but no email is sent and the UI shows a warning.
+- `FROM_EMAIL` -- verified sender, e.g. `Build Guild <no-reply@zeroeng.io>`.
+  Defaults to `Build Guild <onboarding@resend.dev>` (Resend's test sender) if
+  unset. Use a domain verified in your Resend account for production.
+- `PUBLIC_BASE_URL` -- optional; public site URL used to build the "Accept
+  invitation" link (falls back to the request host).
+
 ## Adding a new AI-agent-facing tool
 
 Add its endpoint and auth instructions to the `LLMS_TXT` string in

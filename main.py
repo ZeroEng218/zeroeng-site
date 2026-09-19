@@ -3624,6 +3624,61 @@ async def bg_project_detail(project_id: str,
     return HTMLResponse(_bg_shell(project.get("name") or "Project", body, user))
 
 
+def _bg_send_email(to_email: str, subject: str, html_body: str,
+                   text_body: str = "") -> tuple[bool, str]:
+    """Send a transactional email via the Resend REST API.
+
+    Configuration comes entirely from environment variables so no secrets are
+    committed to the repo:
+        RESEND_API_KEY  -- Resend API key (required to actually send)
+        FROM_EMAIL      -- verified sender, e.g. "Build Guild <no-reply@zeroeng.io>"
+                           (falls back to "onboarding@resend.dev" for testing)
+
+    Returns (ok, error_message). When RESEND_API_KEY is not set, returns
+    (False, "email_not_configured") without raising, so callers can degrade
+    gracefully instead of crashing the request.
+    """
+    api_key = os.environ.get("RESEND_API_KEY")
+    if not api_key:
+        _guild_logger.warning(
+            "Invite email to %s skipped: RESEND_API_KEY is not set.", to_email
+        )
+        return False, "email_not_configured"
+
+    from_email = os.environ.get("FROM_EMAIL") or "Build Guild <onboarding@resend.dev>"
+    payload = {
+        "from": from_email,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body,
+    }
+    if text_body:
+        payload["text"] = text_body
+
+    try:
+        import requests
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+    except Exception as exc:
+        _guild_logger.error("Invite email to %s failed (network): %s", to_email, exc)
+        return False, "email_send_failed"
+
+    if 200 <= resp.status_code < 300:
+        return True, ""
+    _guild_logger.error(
+        "Invite email to %s failed (%s): %s",
+        to_email, resp.status_code, resp.text[:300],
+    )
+    return False, "email_send_failed"
+
+
 @app.post("/build-guild/project/{project_id}/invite")
 async def bg_project_invite(project_id: str, request: Request,
                             bg_session: Optional[str] = Cookie(default=None)):
@@ -3645,7 +3700,7 @@ async def bg_project_invite(project_id: str, request: Request,
     try:
         pres = (
             client.table("projects")
-            .select("id, owner_id")
+            .select("id, name, owner_id")
             .eq("id", project_id)
             .limit(1)
             .execute()
@@ -3715,6 +3770,57 @@ async def bg_project_invite(project_id: str, request: Request,
     except Exception as exc:
         return RedirectResponse(
             f"/build-guild/project/{project_id}?err={_bg_esc(str(exc))[:120]}",
+            status_code=303,
+        )
+
+    # Send the invitation email. The membership row is already saved, so an
+    # email failure must not lose the invite -- we redirect with a warning
+    # instead of falsely claiming the email was sent.
+    project_name = project.get("name") or "a project"
+    inviter = user.get("email") or "A Build Guild member"
+    base = _bg_base_url(request)
+    # Existing users go straight to login; brand-new invitees sign up first.
+    action_url = f"{base}/build-guild/{'login' if linked_user_id else 'signup'}"
+    subject = f"You've been invited to {project_name} on The Build Guild"
+    html_body = (
+        '<div style="font-family:system-ui,Segoe UI,Arial,sans-serif;'
+        'max-width:520px;margin:0 auto;color:#1a1a1a">'
+        '<h2 style="margin:0 0 .6rem">The Build Guild</h2>'
+        f"<p>{_bg_esc(inviter)} has invited you to join "
+        f"<strong>{_bg_esc(project_name)}</strong> as "
+        f"<strong>{_bg_esc(role)}</strong>.</p>"
+        f'<p style="margin:1.2rem 0">'
+        f'<a href="{_bg_esc(action_url)}" '
+        'style="background:#0b5;color:#fff;text-decoration:none;'
+        'padding:.7rem 1.2rem;border-radius:8px;display:inline-block">'
+        "Accept invitation</a></p>"
+        f'<p style="font-size:.85rem;color:#666">'
+        "Use this email address "
+        f"(<strong>{_bg_esc(email)}</strong>) when you "
+        f"{'log in' if linked_user_id else 'sign up'} so your invite is linked "
+        "automatically.</p>"
+        f'<p style="font-size:.8rem;color:#999">If the button does not work, '
+        f"open: {_bg_esc(action_url)}</p>"
+        "</div>"
+    )
+    text_body = (
+        f"{inviter} has invited you to join {project_name} as {role} on "
+        f"The Build Guild.\n\n"
+        f"Accept your invitation: {action_url}\n\n"
+        f"Use this email address ({email}) when you "
+        f"{'log in' if linked_user_id else 'sign up'} so your invite is "
+        "linked automatically."
+    )
+    ok, err = _bg_send_email(email, subject, html_body, text_body)
+    if not ok:
+        note = (
+            "Member+added%2C+but+the+invite+email+could+not+be+sent+"
+            "(email+is+not+configured)."
+            if err == "email_not_configured"
+            else "Member+added%2C+but+the+invite+email+could+not+be+sent."
+        )
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err={note}",
             status_code=303,
         )
 
