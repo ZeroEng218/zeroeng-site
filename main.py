@@ -2738,6 +2738,8 @@ font:inherit;font-weight:600;font-size:.92rem;padding:.8rem 1.4rem;border-radius
 .btn.primary{background:var(--amber);color:#000000;border-color:var(--amber)}
 .btn.primary:hover{filter:brightness(1.08);color:#000000}
 .btn.sm{width:auto;padding:.55rem 1rem;font-size:.85rem}
+.btn.danger{border-color:rgba(220,60,60,.5);color:#f0a0a0}
+.btn.danger:hover{border-color:#dc3c3c;color:#dc3c3c;background:rgba(220,60,60,.08)}
 .row{display:flex;gap:.8rem;flex-wrap:wrap;align-items:center}
 .msg{border-radius:9px;padding:.8rem 1rem;font-size:.9rem;margin-bottom:1.2rem}
 .msg.err{background:rgba(220,60,60,.1);border:1px solid rgba(220,60,60,.4);color:#f0a0a0}
@@ -3482,9 +3484,35 @@ async def bg_new_project_submit(request: Request,
 
 # ── Project detail ─────────────────────────────────────────────────────────
 
+def _bg_can_manage_members(client, project: dict, user: dict) -> bool:
+    """Whether the user may manage members (remove) on this project.
+
+    Authorized when the user owns the project, or is an Admin of the same
+    organization as the project owner. Mirrors the owner-only invite check
+    but additionally lets an org admin help manage the roster.
+    """
+    if not project or not user:
+        return False
+    if project.get("owner_id") == user.get("id"):
+        return True
+    try:
+        caller = _bg_get_membership(client, user["id"])
+        owner_mem = _bg_get_membership(client, project.get("owner_id"))
+    except Exception:
+        return False
+    if not caller or not owner_mem:
+        return False
+    if (caller.get("member_role") or "").lower() != "admin":
+        return False
+    caller_org = (caller.get("org") or {}).get("id")
+    owner_org = (owner_mem.get("org") or {}).get("id")
+    return bool(caller_org) and caller_org == owner_org
+
+
 @app.get("/build-guild/project/{project_id}", response_class=HTMLResponse)
 async def bg_project_detail(project_id: str,
                             invited: Optional[str] = None,
+                            removed: Optional[str] = None,
                             err: Optional[str] = None,
                             bg_session: Optional[str] = Cookie(default=None)):
     user = _bg_get_current_user(bg_session)
@@ -3540,6 +3568,7 @@ async def bg_project_detail(project_id: str,
     )
 
     is_owner = project.get("owner_id") == user["id"]
+    can_manage = _bg_can_manage_members(client, project, user)
     is_member = is_owner or any(m.get("user_id") == user["id"] for m in members)
     if not is_member:
         return HTMLResponse(_bg_shell(
@@ -3555,6 +3584,8 @@ async def bg_project_detail(project_id: str,
     notice = ""
     if invited:
         notice = f'<div class="msg ok">Invitation sent to {_bg_esc(invited)}.</div>'
+    elif removed:
+        notice = f'<div class="msg ok">{_bg_esc(removed)} was removed from the project.</div>'
     elif err:
         notice = f'<div class="msg err">{_bg_esc(err)}</div>'
 
@@ -3570,17 +3601,42 @@ async def bg_project_detail(project_id: str,
             )
         else:
             org_html = '<span class="sub">No organization</span>'
+        action_cell = ""
+        if can_manage:
+            # The project owner cannot be removed; everyone else gets a
+            # Remove button that confirms before submitting.
+            is_owner_row = m.get("user_id") == project.get("owner_id")
+            member_email = m.get("email") or ""
+            if is_owner_row or not member_email:
+                action_cell = '<td><span class="sub">—</span></td>'
+            else:
+                confirm_js = (
+                    "return confirm('Remove "
+                    + _bg_esc(member_email).replace("'", "\\'")
+                    + " from this project? They will lose access.')"
+                )
+                action_cell = (
+                    "<td>"
+                    f'<form method="post" '
+                    f'action="/build-guild/project/{_bg_esc(project_id)}/members/remove" '
+                    f'onsubmit="{confirm_js}" style="margin:0">'
+                    f'<input type="hidden" name="email" value="{_bg_esc(member_email)}">'
+                    '<button class="btn danger sm" type="submit">Remove</button>'
+                    "</form></td>"
+                )
         rows.append(
             "<tr>"
             f"<td>{_bg_esc(m.get('email') or '—')}</td>"
             f"<td>{org_html}</td>"
             f"<td>{_bg_esc(m.get('role') or 'Member')}</td>"
             f"<td>{_bg_esc(m.get('status') or 'active')}</td>"
+            f"{action_cell}"
             "</tr>"
         )
+    action_header = "<th>Action</th>" if can_manage else ""
     members_table = (
         "<table><thead><tr><th>Email</th><th>Organization</th>"
-        "<th>Role</th><th>Status</th></tr></thead>"
+        f"<th>Role</th><th>Status</th>{action_header}</tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
         if rows
         else '<p class="sub">No members yet.</p>'
@@ -3826,6 +3882,89 @@ async def bg_project_invite(project_id: str, request: Request,
 
     return RedirectResponse(
         f"/build-guild/project/{project_id}?invited={email}",
+        status_code=303,
+    )
+
+
+@app.post("/build-guild/project/{project_id}/members/remove")
+async def bg_project_remove_member(project_id: str, request: Request,
+                                   bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    if client is None:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=Database+not+configured",
+            status_code=303,
+        )
+
+    form = await request.form()
+    email = (form.get("email") or "").strip().lower()
+
+    # Load the project so we can verify ownership / authorization.
+    try:
+        pres = (
+            client.table("projects")
+            .select("id, name, owner_id")
+            .eq("id", project_id)
+            .limit(1)
+            .execute()
+        )
+        project = pres.data[0] if pres and pres.data else None
+    except Exception:
+        project = None
+    if not project:
+        return RedirectResponse("/build-guild/dashboard", status_code=303)
+
+    # Only the project owner (or an admin of the owner's org) may remove members.
+    if not _bg_can_manage_members(client, project, user):
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=Only+the+owner+can+remove+members",
+            status_code=303,
+        )
+    if not email:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=No+member+specified",
+            status_code=303,
+        )
+
+    # Find the target membership row.
+    try:
+        mres = (
+            client.table("project_members")
+            .select("id, email, user_id")
+            .eq("project_id", project_id)
+            .eq("email", email)
+            .limit(1)
+            .execute()
+        )
+        member = mres.data[0] if mres and mres.data else None
+    except Exception:
+        member = None
+    if not member:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=That+member+was+not+found",
+            status_code=303,
+        )
+
+    # The project owner cannot be removed (they anchor the project).
+    if member.get("user_id") and member.get("user_id") == project.get("owner_id"):
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=The+project+owner+cannot+be+removed",
+            status_code=303,
+        )
+
+    try:
+        client.table("project_members").delete().eq("id", member["id"]).execute()
+    except Exception as exc:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err={_bg_esc(str(exc))[:120]}",
+            status_code=303,
+        )
+
+    return RedirectResponse(
+        f"/build-guild/project/{project_id}?removed={email}",
         status_code=303,
     )
 
