@@ -2200,19 +2200,19 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         :root {
-            --bg: #0e0c09;
-            --bg-deep: #0a0806;
-            --bg-soft: #16120c;
-            --panel: #1a1610;
-            --panel-hi: #211b12;
-            --border: #2c2519;
-            --border-hi: #3d3320;
-            --text: #f5f0e8;
-            --muted: #b8ac97;
-            --faint: #8a7d66;
-            --amber: #f0a500;
-            --amber-soft: #e8a020;
-            --amber-deep: #b57c00;
+            --bg: #000000;
+            --bg-deep: #000000;
+            --bg-soft: #0a0a0a;
+            --panel: #111111;
+            --panel-hi: #181818;
+            --border: #1f1f1f;
+            --border-hi: #2a2a2a;
+            --text: #ffffff;
+            --muted: #888888;
+            --faint: #444444;
+            --amber: #ffffff;
+            --amber-soft: #cccccc;
+            --amber-deep: #888888;
         }
         html { scroll-behavior: smooth; }
         body {
@@ -2221,10 +2221,7 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
             font-family: 'Inter', system-ui, -apple-system, sans-serif;
             -webkit-font-smoothing: antialiased;
             line-height: 1.6;
-            border-top: 3px solid var(--amber);
-            background-image:
-                radial-gradient(circle at 20% 8%, rgba(240,165,0,0.08), transparent 42%),
-                radial-gradient(circle at 82% 4%, rgba(240,165,0,0.05), transparent 38%);
+            border-top: 2px solid #ffffff;
         }
         code, .mono { font-family: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace; }
         a { color: inherit; text-decoration: none; }
@@ -2234,7 +2231,7 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
         nav {
             position: sticky; top: 0; z-index: 50;
             backdrop-filter: blur(12px);
-            background: rgba(14,12,9,0.78);
+            background: rgba(0,0,0,0.92);
             border-bottom: 1px solid var(--border);
         }
         .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; gap: 1rem; }
@@ -2245,17 +2242,17 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
         .nav-link { font-size: 0.8rem; font-weight: 600; color: var(--muted); transition: color 0.15s; white-space: nowrap; }
         .nav-link:hover { color: var(--amber); }
         .nav-join { color: var(--amber); border: 1px solid var(--amber); border-radius: 999px; padding: 0.35rem 0.85rem; }
-        .nav-join:hover { background: var(--amber); color: #1a1200; }
+        .nav-join:hover { background: var(--amber); color: #000000; }
         .pill { font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--amber); border: 1px solid var(--amber); border-radius: 999px; padding: 0.35rem 0.85rem; white-space: nowrap; }
         @media (max-width: 620px){ .nav-name { display:none; } }
 
         /* Buttons */
         .btn { display: inline-block; border: 1px solid var(--border-hi); background: transparent; color: var(--text); font-family: inherit; font-size: 0.9rem; font-weight: 600; padding: 0.85rem 1.5rem; border-radius: 9px; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
         .btn:hover { border-color: var(--amber); color: var(--amber); transform: translateY(-2px); }
-        .btn.primary { background: var(--amber); color: #1a1200; border-color: var(--amber); }
-        .btn.primary:hover { background: var(--amber-soft); color: #1a1200; box-shadow: 0 10px 30px -12px rgba(240,165,0,0.6); }
+        .btn.primary { background: var(--amber); color: #000000; border-color: var(--amber); }
+        .btn.primary:hover { background: var(--amber-soft); color: #000000; box-shadow: 0 10px 30px -12px rgba(255,255,255,0.20); }
         .btn.ghost { border-color: var(--amber); color: var(--amber); }
-        .btn.ghost:hover { background: rgba(240,165,0,0.08); }
+        .btn.ghost:hover { background: rgba(255,255,255,0.08); }
 
         /* Hero */
         .hero { padding: 6rem 0 4rem; text-align: center; }
@@ -2266,7 +2263,7 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
             text-transform: uppercase;
             color: var(--amber);
             line-height: 1.02;
-            text-shadow: 0 0 60px rgba(240,165,0,0.25);
+            text-shadow: 0 0 80px rgba(255,255,255,0.10);
         }
         .hero .rule { width: 120px; height: 2px; background: var(--amber); margin: 1.8rem auto; border: none; }
         .hero .tagline { font-size: clamp(1.1rem, 2.6vw, 1.3rem); font-weight: 300; color: var(--text); letter-spacing: 0.01em; }
@@ -2300,7 +2297,7 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
         .step p { font-size: 0.88rem; color: var(--muted); font-weight: 300; }
 
         /* Agent box */
-        .agent-box { max-width: 840px; margin: 0 auto; position: relative; background: var(--bg-deep); border: 1px solid var(--amber); border-radius: 13px; padding: 1.6rem 1.7rem; box-shadow: 0 20px 60px -32px rgba(240,165,0,0.4); }
+        .agent-box { max-width: 840px; margin: 0 auto; position: relative; background: var(--bg-deep); border: 1px solid var(--amber); border-radius: 13px; padding: 1.6rem 1.7rem; box-shadow: 0 20px 60px -32px rgba(255,255,255,0.06); }
         .agent-box pre { font-family: 'IBM Plex Mono', monospace; font-size: 0.84rem; line-height: 1.85; color: var(--text); white-space: pre-wrap; word-break: break-word; }
         .agent-box .cmt { color: var(--faint); }
         .agent-box .verb { color: var(--amber); font-weight: 500; }
@@ -2317,7 +2314,7 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
         .a2a-skill p { font-size: 0.85rem; color: var(--muted); font-weight: 300; line-height: 1.6; }
 
         /* Early access panel */
-        .ea-panel { max-width: 860px; margin: 0 auto; text-align: center; background: linear-gradient(180deg, rgba(240,165,0,0.10), rgba(240,165,0,0.03)); border: 1px solid var(--border-hi); border-radius: 16px; padding: 3rem 2rem; }
+        .ea-panel { max-width: 860px; margin: 0 auto; text-align: center; background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.01)); border: 1px solid var(--border-hi); border-radius: 16px; padding: 3rem 2rem; }
         .ea-panel h2 { font-size: clamp(1.6rem, 4vw, 2.3rem); font-weight: 700; color: var(--text); margin-bottom: 1rem; letter-spacing: -0.01em; }
         .ea-panel p { max-width: 620px; margin: 0 auto 1.8rem; color: var(--muted); font-size: 1rem; font-weight: 300; }
 
@@ -2329,7 +2326,7 @@ BUILD_GUILD_PAGE = """<!DOCTYPE html>
         .foot-links a { color: var(--muted); } .foot-links a:hover { color: var(--amber); }
 
         /* Toast */
-        .toast { position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--amber); color: #1a1200; font-weight: 700; font-size: 0.85rem; padding: 0.7rem 1.3rem; border-radius: 9px; opacity: 0; pointer-events: none; transition: all 0.25s; z-index: 100; }
+        .toast { position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--amber); color: #000000; font-weight: 700; font-size: 0.85rem; padding: 0.7rem 1.3rem; border-radius: 9px; opacity: 0; pointer-events: none; transition: all 0.25s; z-index: 100; }
         .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
     </style>
 </head>
