@@ -2639,6 +2639,62 @@ def _bg_get_membership(client, user_id: str) -> Optional[dict]:
     return {"org": org, "member_role": m.get("role") or "Member"}
 
 
+def _bg_orgs_for_users(client, user_ids: list) -> dict:
+    """Resolve each user's organization (name + industry role).
+
+    Joins project/organization membership through to the organizations table:
+      organization_members.user_id -> org_id -> organizations(name, role)
+
+    Returns a map: user_id -> {"name": str, "role": str}. Users without an
+    organization (e.g. invited-by-email members who have not joined one) are
+    simply omitted from the map.
+    """
+    ids = [uid for uid in dict.fromkeys(user_ids) if uid]
+    if client is None or not ids:
+        return {}
+    # user_id -> org_id
+    org_by_user: dict = {}
+    try:
+        mres = (
+            client.table("organization_members")
+            .select("user_id, org_id")
+            .in_("user_id", ids)
+            .execute()
+        )
+        for row in (mres.data or []):
+            uid, oid = row.get("user_id"), row.get("org_id")
+            if uid and oid and uid not in org_by_user:
+                org_by_user[uid] = oid
+    except Exception:
+        return {}
+    org_ids = list(dict.fromkeys(org_by_user.values()))
+    if not org_ids:
+        return {}
+    # org_id -> {name, role}
+    org_info: dict = {}
+    try:
+        ores = (
+            client.table("organizations")
+            .select("id, name, role")
+            .in_("id", org_ids)
+            .execute()
+        )
+        for row in (ores.data or []):
+            oid = row.get("id")
+            if oid:
+                org_info[oid] = {
+                    "name": row.get("name") or "",
+                    "role": row.get("role") or "",
+                }
+    except Exception:
+        return {}
+    return {
+        uid: org_info[oid]
+        for uid, oid in org_by_user.items()
+        if oid in org_info
+    }
+
+
 def _bg_esc(value: Any) -> str:
     """Minimal HTML escaping for user-supplied text."""
     if value is None:
@@ -2698,6 +2754,7 @@ border:1px solid var(--border-hi);border-radius:999px;padding:.2rem .6rem;margin
 table{width:100%;border-collapse:collapse;margin-top:.6rem}
 th,td{text-align:left;padding:.6rem .5rem;border-bottom:1px solid var(--border);font-size:.9rem}
 th{color:var(--faint);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}
+.org-badge{display:inline-block;font-size:.82rem;color:var(--text);background:var(--border);border:1px solid var(--border-hi);border-radius:999px;padding:.15rem .55rem;white-space:nowrap}
 .pagehead{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;margin:2rem 0 .5rem}
 .section{margin-top:2rem}
 .backlink{font-size:.84rem;color:var(--muted)}
@@ -3476,6 +3533,12 @@ async def bg_project_detail(project_id: str,
     except Exception:
         members = []
 
+    # Join through to each member's organization (name + industry role) so the
+    # roster can show which firm every member belongs to at a glance.
+    orgs_by_user = _bg_orgs_for_users(
+        client, [m.get("user_id") for m in members]
+    )
+
     is_owner = project.get("owner_id") == user["id"]
     is_member = is_owner or any(m.get("user_id") == user["id"] for m in members)
     if not is_member:
@@ -3497,15 +3560,27 @@ async def bg_project_detail(project_id: str,
 
     rows = []
     for m in members:
+        org = orgs_by_user.get(m.get("user_id"))
+        if org and org.get("name"):
+            parts = [_bg_esc(org["name"])]
+            if org.get("role"):
+                parts.append(_bg_esc(org["role"]))
+            org_html = (
+                '<span class="org-badge">' + " &middot; ".join(parts) + "</span>"
+            )
+        else:
+            org_html = '<span class="sub">No organization</span>'
         rows.append(
             "<tr>"
             f"<td>{_bg_esc(m.get('email') or '—')}</td>"
+            f"<td>{org_html}</td>"
             f"<td>{_bg_esc(m.get('role') or 'Member')}</td>"
             f"<td>{_bg_esc(m.get('status') or 'active')}</td>"
             "</tr>"
         )
     members_table = (
-        "<table><thead><tr><th>Email</th><th>Role</th><th>Status</th></tr></thead>"
+        "<table><thead><tr><th>Email</th><th>Organization</th>"
+        "<th>Role</th><th>Status</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
         if rows
         else '<p class="sub">No members yet.</p>'
