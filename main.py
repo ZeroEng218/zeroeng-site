@@ -2578,6 +2578,54 @@ def _bg_ensure_profile(client, user: dict) -> dict:
     return profile
 
 
+# ── Organizations ────────────────────────────────────────────────────────
+# Every logged-in user must belong to an organization (the licensed company
+# authorized to conduct business). After login a user with no organization is
+# gated to a chooser: "Create an organization" or "Join an organization".
+
+ORG_ROLES = ["Architect", "Engineer", "Contractor", "Vendor", "Owner"]
+
+
+def _bg_gen_join_code() -> str:
+    """Short, unambiguous invite code others use to join an organization."""
+    import secrets
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def _bg_get_membership(client, user_id: str) -> Optional[dict]:
+    """Return the user's organization + role, or None if not a member."""
+    if client is None:
+        return None
+    try:
+        mres = (
+            client.table("organization_members")
+            .select("org_id, role, status")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        m = mres.data[0] if mres and mres.data else None
+    except Exception:
+        m = None
+    if not m:
+        return None
+    try:
+        ores = (
+            client.table("organizations")
+            .select("id, name, role, license_number, license_jurisdiction, join_code, created_by, created_at")
+            .eq("id", m["org_id"])
+            .limit(1)
+            .execute()
+        )
+        org = ores.data[0] if ores and ores.data else None
+    except Exception:
+        org = None
+    if not org:
+        return None
+    return {"org": org, "member_role": m.get("role") or "Member"}
+
+
 def _bg_esc(value: Any) -> str:
     """Minimal HTML escaping for user-supplied text."""
     if value is None:
@@ -2909,6 +2957,233 @@ async def bg_set_session(request: Request):
     return resp
 
 
+# ── Organization: create / join gate ────────────────────────────────────────
+
+def _bg_org_chooser(user: dict, error: str = "") -> str:
+    err = f'<div class="msg err">{_bg_esc(error)}</div>' if error else ""
+    body = (
+        '<div class="wrap narrow" style="padding-top:3rem;padding-bottom:3rem">'
+        '<div class="card">'
+        "<h1>Join an organization</h1>"
+        '<p class="sub">Every member works under an organization — the company '
+        "that holds the license to conduct business. Create a new one, or join "
+        "an existing organization with an invite code.</p>"
+        f"{err}"
+        '<a class="btn primary" href="/build-guild/org/create">Create an organization</a>'
+        '<div style="height:.8rem"></div>'
+        '<a class="btn" href="/build-guild/org/join">Join an organization</a>'
+        '<p class="foot">Signed in as ' + _bg_esc(user.get("email") or "") +
+        ' · <a href="/build-guild/logout">Log out</a></p>'
+        "</div></div>"
+    )
+    return _bg_shell("Join an organization", body, user)
+
+
+@app.get("/build-guild/org", response_class=HTMLResponse)
+async def bg_org_chooser_page(bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    if _bg_get_membership(client, user["id"]):
+        return RedirectResponse("/build-guild/dashboard", status_code=303)
+    return HTMLResponse(_bg_org_chooser(user))
+
+
+# ── Create organization ──────────────────────────────────────────────────
+
+def _bg_org_create_form(user: dict, error: str = "", values: Optional[dict] = None) -> str:
+    v = values or {}
+    err = f'<div class="msg err">{_bg_esc(error)}</div>' if error else ""
+    opts = "".join(
+        f'<option value="{r}"{" selected" if v.get("role") == r else ""}>{r}</option>'
+        for r in ORG_ROLES
+    )
+    body = (
+        '<div class="wrap narrow" style="padding-top:2.4rem;padding-bottom:3rem">'
+        '<a class="backlink" href="/build-guild/org">&larr; Back</a>'
+        '<div class="card" style="margin-top:1rem">'
+        "<h1>Create an organization</h1>"
+        '<p class="sub">Register your company. You become its admin and get an '
+        "invite code to add teammates.</p>"
+        f"{err}"
+        '<form method="post" action="/build-guild/org/create">'
+        '<label for="name">Organization name</label>'
+        f'<input id="name" name="name" type="text" value="{_bg_esc(v.get("name",""))}" required>'
+        '<label for="role">Industry role</label>'
+        f'<select id="role" name="role" required><option value="">Select a role…</option>{opts}</select>'
+        '<label for="license_number">License number</label>'
+        f'<input id="license_number" name="license_number" type="text" value="{_bg_esc(v.get("license_number",""))}" required>'
+        '<label for="license_jurisdiction">License jurisdiction <span style="text-transform:none;color:var(--faint)">(state / AHJ)</span></label>'
+        f'<input id="license_jurisdiction" name="license_jurisdiction" type="text" placeholder="e.g. Texas" value="{_bg_esc(v.get("license_jurisdiction",""))}" required>'
+        '<div style="height:1.4rem"></div>'
+        '<button class="btn primary" type="submit">Create organization</button>'
+        "</form></div></div>"
+    )
+    return _bg_shell("Create an organization", body, user)
+
+
+@app.get("/build-guild/org/create", response_class=HTMLResponse)
+async def bg_org_create_page(bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    if _bg_get_membership(client, user["id"]):
+        return RedirectResponse("/build-guild/dashboard", status_code=303)
+    return HTMLResponse(_bg_org_create_form(user))
+
+
+@app.post("/build-guild/org/create", response_class=HTMLResponse)
+async def bg_org_create_submit(request: Request,
+                               bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    if client is None:
+        return HTMLResponse(_bg_org_create_form(user, "Database is not configured on this server."))
+    if _bg_get_membership(client, user["id"]):
+        return RedirectResponse("/build-guild/dashboard", status_code=303)
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    role = (form.get("role") or "").strip()
+    license_number = (form.get("license_number") or "").strip()
+    license_jurisdiction = (form.get("license_jurisdiction") or "").strip()
+    values = {"name": name, "role": role, "license_number": license_number,
+              "license_jurisdiction": license_jurisdiction}
+
+    if not name or not role or not license_number or not license_jurisdiction:
+        return HTMLResponse(_bg_org_create_form(
+            user, "All fields are required to register a licensed organization.", values))
+    if role not in ORG_ROLES:
+        return HTMLResponse(_bg_org_create_form(user, "Please select a valid industry role.", values))
+
+    # Generate a unique join code (retry a few times on the rare collision).
+    org_row = None
+    for _ in range(5):
+        code = _bg_gen_join_code()
+        try:
+            res = (
+                client.table("organizations")
+                .insert({
+                    "name": name,
+                    "role": role,
+                    "license_number": license_number,
+                    "license_jurisdiction": license_jurisdiction,
+                    "join_code": code,
+                    "created_by": user["id"],
+                })
+                .execute()
+            )
+            org_row = res.data[0] if res and res.data else None
+            if org_row:
+                break
+        except Exception as exc:
+            if "duplicate" in str(exc).lower() and "join_code" in str(exc).lower():
+                continue
+            return HTMLResponse(_bg_org_create_form(user, f"Could not create organization: {exc}", values))
+
+    if not org_row:
+        return HTMLResponse(_bg_org_create_form(user, "Could not create organization. Please try again.", values))
+
+    try:
+        client.table("organization_members").insert({
+            "org_id": org_row["id"],
+            "user_id": user["id"],
+            "email": user.get("email"),
+            "role": "Admin",
+            "status": "active",
+        }).execute()
+    except Exception as exc:
+        return HTMLResponse(_bg_org_create_form(user, f"Organization created but membership failed: {exc}", values))
+
+    return RedirectResponse("/build-guild/dashboard", status_code=303)
+
+
+# ── Join organization ────────────────────────────────────────────────────
+
+def _bg_org_join_form(user: dict, error: str = "", code: str = "") -> str:
+    err = f'<div class="msg err">{_bg_esc(error)}</div>' if error else ""
+    body = (
+        '<div class="wrap narrow" style="padding-top:2.4rem;padding-bottom:3rem">'
+        '<a class="backlink" href="/build-guild/org">&larr; Back</a>'
+        '<div class="card" style="margin-top:1rem">'
+        "<h1>Join an organization</h1>"
+        '<p class="sub">Enter the invite code shared by your organization admin.</p>'
+        f"{err}"
+        '<form method="post" action="/build-guild/org/join">'
+        '<label for="join_code">Invite code</label>'
+        f'<input id="join_code" name="join_code" type="text" autocomplete="off" '
+        f'style="text-transform:uppercase;letter-spacing:.2em" value="{_bg_esc(code)}" required>'
+        '<div style="height:1.4rem"></div>'
+        '<button class="btn primary" type="submit">Join organization</button>'
+        "</form></div></div>"
+    )
+    return _bg_shell("Join an organization", body, user)
+
+
+@app.get("/build-guild/org/join", response_class=HTMLResponse)
+async def bg_org_join_page(bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    if _bg_get_membership(client, user["id"]):
+        return RedirectResponse("/build-guild/dashboard", status_code=303)
+    return HTMLResponse(_bg_org_join_form(user))
+
+
+@app.post("/build-guild/org/join", response_class=HTMLResponse)
+async def bg_org_join_submit(request: Request,
+                             bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    if client is None:
+        return HTMLResponse(_bg_org_join_form(user, "Database is not configured on this server."))
+    if _bg_get_membership(client, user["id"]):
+        return RedirectResponse("/build-guild/dashboard", status_code=303)
+
+    form = await request.form()
+    code = (form.get("join_code") or "").strip().upper()
+    if not code:
+        return HTMLResponse(_bg_org_join_form(user, "Please enter an invite code."))
+
+    try:
+        ores = (
+            client.table("organizations")
+            .select("id, name")
+            .eq("join_code", code)
+            .limit(1)
+            .execute()
+        )
+        org = ores.data[0] if ores and ores.data else None
+    except Exception as exc:
+        return HTMLResponse(_bg_org_join_form(user, f"Could not look up code: {exc}", code))
+
+    if not org:
+        return HTMLResponse(_bg_org_join_form(user, "That invite code is not valid.", code))
+
+    try:
+        client.table("organization_members").insert({
+            "org_id": org["id"],
+            "user_id": user["id"],
+            "email": user.get("email"),
+            "role": "Member",
+            "status": "active",
+        }).execute()
+    except Exception as exc:
+        msg = str(exc)
+        if "duplicate" in msg.lower():
+            return RedirectResponse("/build-guild/dashboard", status_code=303)
+        return HTMLResponse(_bg_org_join_form(user, f"Could not join organization: {exc}", code))
+
+    return RedirectResponse("/build-guild/dashboard", status_code=303)
+
+
 # ── Dashboard ───────────────────────────────────────────────────────────────
 
 def _bg_user_projects(client, user_id: str) -> list:
@@ -2960,10 +3235,43 @@ async def bg_dashboard(bg_session: Optional[str] = Cookie(default=None)):
     if not user:
         return RedirectResponse("/build-guild/login", status_code=303)
     client = get_supabase()
+    # Gate: a user must belong to an organization before using the dashboard.
+    membership = _bg_get_membership(client, user["id"])
+    if not membership:
+        return RedirectResponse("/build-guild/org", status_code=303)
+    org = membership["org"]
+    member_role = membership["member_role"]
+
     profile = _bg_ensure_profile(client, user)
     projects = _bg_user_projects(client, user["id"])
 
     name = profile.get("display_name") or user.get("email") or "Member"
+
+    lic = org.get("license_number")
+    juris = org.get("license_jurisdiction")
+    lic_line = ""
+    if lic or juris:
+        lic_txt = _bg_esc(lic or "")
+        if juris:
+            lic_txt += f' · {_bg_esc(juris)}'
+        lic_line = f'<div style="color:var(--muted);font-size:.85rem;margin-top:.2rem">License: {lic_txt}</div>'
+    invite_html = ""
+    if member_role == "Admin":
+        invite_html = (
+            '<div style="margin-top:.7rem;font-size:.82rem;color:var(--muted)">Invite code: '
+            f'<span style="color:var(--text);font-weight:600;letter-spacing:.14em">{_bg_esc(org.get("join_code") or "")}</span> '
+            '<span style="color:var(--faint)">— share this so teammates can join</span></div>'
+        )
+    org_banner = (
+        '<div class="card" style="margin-bottom:1.4rem">'
+        f'<div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:var(--faint)">Organization</div>'
+        f'<div style="font-size:1.15rem;font-weight:600;margin-top:.15rem">{_bg_esc(org.get("name") or "")}'
+        f' <span class="tag" style="margin-left:.4rem">{_bg_esc(member_role)}</span></div>'
+        + (f'<div style="color:var(--muted);font-size:.85rem;margin-top:.2rem">{_bg_esc(org.get("role") or "")}</div>' if org.get("role") else "")
+        + lic_line
+        + invite_html
+        + "</div>"
+    )
     if projects:
         cards = []
         for p in projects:
@@ -2985,7 +3293,8 @@ async def bg_dashboard(bg_session: Optional[str] = Cookie(default=None)):
         )
 
     body = (
-        '<div class="wrap" style="padding-bottom:4rem">'
+        '<div class="wrap" style="padding-top:1.6rem;padding-bottom:4rem">'
+        f"{org_banner}"
         '<div class="pagehead">'
         f"<div><h1>Welcome, {_bg_esc(name)}</h1>"
         '<p class="sub" style="margin-bottom:0">Your Build Guild projects</p></div>'
