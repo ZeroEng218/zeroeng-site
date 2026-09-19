@@ -2551,6 +2551,30 @@ def _bg_get_current_user(bg_session: Optional[str]) -> Optional[dict]:
     return {"id": uid, "email": email}
 
 
+def _bg_link_pending_invites(client, user_id: str, email: str) -> None:
+    """Claim any open project-member invites for this email address.
+
+    When someone is invited before they have an account the membership row is
+    saved with ``user_id = NULL`` and ``status = 'invited'``.  After they sign
+    up or log in we backfill their ``user_id`` so ``_bg_user_projects`` can
+    find the project.  Best-effort: failures are logged but never propagate.
+    """
+    if not (client and user_id and email):
+        return
+    try:
+        (
+            client.table("project_members")
+            .update({"user_id": user_id, "status": "active"})
+            .eq("email", email.lower())
+            .is_("user_id", None)
+            .execute()
+        )
+    except Exception as exc:
+        _guild_logger.warning(
+            "Could not link pending invites for %s: %s", email, exc
+        )
+
+
 def _bg_ensure_profile(client, user: dict) -> dict:
     """Fetch (creating if missing) the user_profiles row for this user."""
     try:
@@ -2895,6 +2919,9 @@ async def bg_signup_submit(request: Request):
 
     # If email confirmation is disabled, a session is returned immediately.
     if session is not None and getattr(session, "access_token", None):
+        user_obj = getattr(res, "user", None)
+        if user_obj and getattr(user_obj, "id", None):
+            _bg_link_pending_invites(client, str(user_obj.id), email.lower())
         resp = RedirectResponse("/build-guild/dashboard", status_code=303)
         _bg_set_session_cookie(resp, session.access_token)
         return resp
@@ -2949,6 +2976,12 @@ async def bg_login_submit(request: Request):
     if session is None or not getattr(session, "access_token", None):
         return HTMLResponse(_bg_auth_form("login", "Login failed. Please try again.", email))
 
+    # Claim any project-member rows that were saved with user_id=NULL when the
+    # invite was sent before this user had an account.
+    user_obj = getattr(res, "user", None)
+    if user_obj and getattr(user_obj, "id", None):
+        _bg_link_pending_invites(client, str(user_obj.id), email.lower())
+
     resp = RedirectResponse("/build-guild/dashboard", status_code=303)
     _bg_set_session_cookie(resp, session.access_token)
     return resp
@@ -2978,6 +3011,11 @@ async def bg_verify(
             )
             session = getattr(res, "session", None)
             if session is not None and getattr(session, "access_token", None):
+                user_obj = getattr(res, "user", None)
+                if user_obj and getattr(user_obj, "id", None) and getattr(user_obj, "email", None):
+                    _bg_link_pending_invites(
+                        client, str(user_obj.id), str(user_obj.email).lower()
+                    )
                 resp = RedirectResponse("/build-guild/dashboard", status_code=303)
                 _bg_set_session_cookie(resp, session.access_token)
                 return resp
@@ -3024,6 +3062,8 @@ async def bg_set_session(request: Request):
     user = _bg_get_current_user(token)
     if not user:
         return JSONResponse({"ok": False, "error": "invalid_token"}, status_code=401)
+    if user.get("email"):
+        _bg_link_pending_invites(get_supabase(), user["id"], user["email"].lower())
     resp = JSONResponse({"ok": True})
     _bg_set_session_cookie(resp, token)
     return resp
