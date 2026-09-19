@@ -2585,6 +2585,19 @@ def _bg_ensure_profile(client, user: dict) -> dict:
 
 ORG_ROLES = ["Architect", "Engineer", "Contractor", "Vendor", "Owner"]
 
+US_STATES = [
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "Florida", "Georgia", "Hawaii", "Idaho",
+    "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana",
+    "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+    "New Hampshire", "New Jersey", "New Mexico", "New York",
+    "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon",
+    "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
+    "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
+    "West Virginia", "Wisconsin", "Wyoming"
+]
+
 
 def _bg_gen_join_code() -> str:
     """Short, unambiguous invite code others use to join an organization."""
@@ -2995,9 +3008,13 @@ async def bg_org_chooser_page(bg_session: Optional[str] = Cookie(default=None)):
 def _bg_org_create_form(user: dict, error: str = "", values: Optional[dict] = None) -> str:
     v = values or {}
     err = f'<div class="msg err">{_bg_esc(error)}</div>' if error else ""
-    opts = "".join(
+    role_opts = "".join(
         f'<option value="{r}"{" selected" if v.get("role") == r else ""}>{r}</option>'
         for r in ORG_ROLES
+    )
+    state_opts = "".join(
+        f'<option value="{s}"{" selected" if v.get("license_jurisdiction") == s else ""}>{s}</option>'
+        for s in US_STATES
     )
     body = (
         '<div class="wrap narrow" style="padding-top:2.4rem;padding-bottom:3rem">'
@@ -3011,11 +3028,11 @@ def _bg_org_create_form(user: dict, error: str = "", values: Optional[dict] = No
         '<label for="name">Organization name</label>'
         f'<input id="name" name="name" type="text" value="{_bg_esc(v.get("name",""))}" required>'
         '<label for="role">Industry role</label>'
-        f'<select id="role" name="role" required><option value="">Select a role…</option>{opts}</select>'
+        f'<select id="role" name="role" required><option value="">Select a role…</option>{role_opts}</select>'
         '<label for="license_number">License number</label>'
         f'<input id="license_number" name="license_number" type="text" value="{_bg_esc(v.get("license_number",""))}" required>'
-        '<label for="license_jurisdiction">License jurisdiction <span style="text-transform:none;color:var(--faint)">(state / AHJ)</span></label>'
-        f'<input id="license_jurisdiction" name="license_jurisdiction" type="text" placeholder="e.g. Texas" value="{_bg_esc(v.get("license_jurisdiction",""))}" required>'
+        '<label for="license_jurisdiction">License jurisdiction</label>'
+        f'<select id="license_jurisdiction" name="license_jurisdiction" required><option value="">Select a state…</option>{state_opts}</select>'
         '<div style="height:1.4rem"></div>'
         '<button class="btn primary" type="submit">Create organization</button>'
         "</form></div></div>"
