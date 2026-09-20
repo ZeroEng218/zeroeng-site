@@ -3099,6 +3099,10 @@ async def bg_org_chooser_page(bg_session: Optional[str] = Cookie(default=None)):
     client = get_supabase()
     if _bg_get_membership(client, user["id"]):
         return RedirectResponse("/build-guild/dashboard", status_code=303)
+    # Domain auto-grouping: forward straight to the dashboard if the email
+    # domain matches an existing organization.
+    if _bg_try_domain_autojoin(client, user):
+        return RedirectResponse("/build-guild/dashboard", status_code=303)
     return HTMLResponse(_bg_org_chooser(user))
 
 
@@ -3181,18 +3185,37 @@ async def bg_org_create_submit(request: Request,
     for _ in range(5):
         code = _bg_gen_join_code()
         try:
-            res = (
-                client.table("organizations")
-                .insert({
-                    "name": name,
-                    "role": role,
-                    "license_number": license_number,
-                    "license_jurisdiction": license_jurisdiction,
-                    "join_code": code,
-                    "created_by": user["id"],
-                })
-                .execute()
-            )
+            org_insert = {
+                "name": name,
+                "role": role,
+                "license_number": license_number,
+                "license_jurisdiction": license_jurisdiction,
+                "join_code": code,
+                "created_by": user["id"],
+            }
+            # Domain auto-grouping: tag the org with the creator's email domain
+            # (skipping generic consumer providers) so teammates on the same
+            # domain are auto-joined on sign-in. Best-effort — if the column is
+            # absent the insert is retried without it below.
+            _creator_domain = _bg_email_domain(user.get("email"))
+            if _creator_domain:
+                org_insert["domain"] = _creator_domain
+            try:
+                res = (
+                    client.table("organizations")
+                    .insert(org_insert)
+                    .execute()
+                )
+            except Exception as _dom_exc:
+                if "domain" in str(_dom_exc).lower() and "domain" in org_insert:
+                    org_insert.pop("domain", None)
+                    res = (
+                        client.table("organizations")
+                        .insert(org_insert)
+                        .execute()
+                    )
+                else:
+                    raise
             org_row = res.data[0] if res and res.data else None
             if org_row:
                 break
@@ -3356,6 +3379,11 @@ async def bg_dashboard(bg_session: Optional[str] = Cookie(default=None),
     # Gate: a user must belong to an organization before using the dashboard.
     membership = _bg_get_membership(client, user["id"])
     if not membership:
+        # Domain auto-grouping: if the user's email domain matches an existing
+        # organization, auto-join them as a Member before falling back to the
+        # create / invite-code chooser.
+        membership = _bg_try_domain_autojoin(client, user)
+    if not membership:
         return RedirectResponse("/build-guild/org", status_code=303)
     org = membership["org"]
     member_role = membership["member_role"]
@@ -3380,6 +3408,11 @@ async def bg_dashboard(bg_session: Optional[str] = Cookie(default=None),
             f'<span style="color:var(--text);font-weight:600;letter-spacing:.14em">{_bg_esc(org.get("join_code") or "")}</span> '
             '<span style="color:var(--faint)">— share this so teammates can join</span></div>'
         )
+    agents_link = (
+        '<div style="margin-top:.9rem">'
+        '<a class="btn sm" href="/build-guild/org/agents">Organization Agents &rarr;</a>'
+        "</div>"
+    )
     org_banner = (
         '<div class="card" style="margin-bottom:1.4rem">'
         f'<div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:var(--faint)">Organization</div>'
@@ -3388,6 +3421,7 @@ async def bg_dashboard(bg_session: Optional[str] = Cookie(default=None),
         + (f'<div style="color:var(--muted);font-size:.85rem;margin-top:.2rem">{_bg_esc(org.get("role") or "")}</div>' if org.get("role") else "")
         + lic_line
         + invite_html
+        + agents_link
         + "</div>"
     )
     if projects:
@@ -3558,11 +3592,106 @@ def _bg_can_manage_members(client, project: dict, user: dict) -> bool:
     return bool(caller_org) and caller_org == owner_org
 
 
+def _bg_agent_row_html(project_id: str, a: dict, *, allow_manage: bool) -> str:
+    """One agent row for the project panel (Message + optional manage actions)."""
+    status = (a.get("status") or "pending").lower()
+    caps = _bg_agent_card_summary(a.get("discovery_card") or {})
+    caps_html = (f'<div class="sub" style="margin:.2rem 0 0">{_bg_esc(caps)}</div>'
+                 if caps else "")
+    msg_btn = (
+        f'<a class="btn sm" href="/build-guild/project/{_bg_esc(project_id)}/agents/{_bg_esc(a["id"])}/thread">Message</a>'
+        if status == "approved"
+        else '<span class="sub">unavailable</span>'
+    )
+    manage = ""
+    if allow_manage:
+        manage = (
+            f' <form method="post" action="/build-guild/project/{_bg_esc(project_id)}/agents/{_bg_esc(a["id"])}/ping" '
+            'style="display:inline;margin:0"><button class="btn sm" type="submit">Ping</button></form>'
+        )
+        if status != "offline":
+            manage += (
+                f' <form method="post" action="/build-guild/project/{_bg_esc(project_id)}/agents/{_bg_esc(a["id"])}/deactivate" '
+                "onsubmit=\"return confirm('Deactivate this agent?')\" style=\"display:inline;margin:0\">"
+                '<button class="btn danger sm" type="submit">Deactivate</button></form>'
+            )
+    return (
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;'
+        'padding:.8rem 0;border-bottom:1px solid var(--border)">'
+        "<div style=\"min-width:0\">"
+        f'<div style="font-weight:600">{_bg_esc(a.get("name") or "Agent")} '
+        f'{_bg_agent_status_badge(a.get("status"))}</div>'
+        f'<div class="sub" style="margin:.2rem 0 0;word-break:break-all">{_bg_esc(a.get("agent_url") or "")}</div>'
+        f"{caps_html}</div>"
+        f'<div style="white-space:nowrap;display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">{msg_btn}{manage}</div>'
+        "</div>"
+    )
+
+
+def _bg_project_agents_panel(project_id: str, company_agents: list,
+                             project_agents: list) -> str:
+    """Render the in-project agent panel (company + project agents)."""
+    if company_agents:
+        company_html = "".join(
+            _bg_agent_row_html(project_id, a, allow_manage=False)
+            for a in company_agents
+        )
+    else:
+        company_html = (
+            '<p class="sub">No approved company agents yet. An org admin can '
+            'register one under <a href="/build-guild/org/agents">Organization Agents</a>.</p>'
+        )
+
+    if project_agents:
+        project_html = "".join(
+            _bg_agent_row_html(project_id, a, allow_manage=True)
+            for a in project_agents
+        )
+    else:
+        project_html = '<p class="sub">No project agents yet.</p>'
+
+    modal = (
+        '<div id="projAgentModal" style="display:none;position:fixed;inset:0;z-index:100;'
+        'background:rgba(0,0,0,.7);align-items:center;justify-content:center;padding:1rem">'
+        '<div class="card" style="max-width:460px;width:100%">'
+        "<h2>Create Project Agent</h2>"
+        '<p class="sub" style="margin-bottom:1rem">Register an agent resident to this '
+        "project. Build Guild verifies it via its discovery card at "
+        "<code>/.well-known/agent.json</code>.</p>"
+        f'<form method="post" action="/build-guild/project/{_bg_esc(project_id)}/agents/create">'
+        '<label for="pa_name">Agent name</label>'
+        '<input id="pa_name" name="name" type="text" required placeholder="e.g. Structural Review Agent">'
+        '<label for="pa_url">Agent URL</label>'
+        '<input id="pa_url" name="agent_url" type="url" required placeholder="https://your-agent.example.com">'
+        '<div style="height:1.2rem"></div>'
+        '<div class="row" style="justify-content:flex-end">'
+        '<button class="btn sm" type="button" '
+        "onclick=\"document.getElementById('projAgentModal').style.display='none'\">Cancel</button>"
+        '<button class="btn primary sm" type="submit">Verify &amp; register</button>'
+        "</div></form></div></div>"
+    )
+
+    return (
+        '<div class="section"><div class="pagehead" style="margin:0 0 .4rem">'
+        "<h2 style=\"margin:0\">Agents</h2>"
+        '<button class="btn primary sm" type="button" '
+        "onclick=\"document.getElementById('projAgentModal').style.display='flex'\">"
+        "+ Create Project Agent</button></div>"
+        '<h3 style="font-size:.95rem;margin:1rem 0 .2rem;color:var(--muted)">Company agents</h3>'
+        f"{company_html}"
+        '<h3 style="font-size:.95rem;margin:1.4rem 0 .2rem;color:var(--muted)">Project agents</h3>'
+        f"{project_html}"
+        f"{modal}"
+        "</div>"
+    )
+
+
 @app.get("/build-guild/project/{project_id}", response_class=HTMLResponse)
 async def bg_project_detail(project_id: str,
                             invited: Optional[str] = None,
                             removed: Optional[str] = None,
                             err: Optional[str] = None,
+                            agent_notice: Optional[str] = None,
                             bg_session: Optional[str] = Cookie(default=None)):
     user = _bg_get_current_user(bg_session)
     if not user:
@@ -3635,6 +3764,8 @@ async def bg_project_detail(project_id: str,
         notice = f'<div class="msg ok">Invitation sent to {_bg_esc(invited)}.</div>'
     elif removed:
         notice = f'<div class="msg ok">{_bg_esc(removed)} was removed from the project.</div>'
+    elif agent_notice:
+        notice = f'<div class="msg ok">{_bg_esc(agent_notice)}</div>'
     elif err:
         notice = f'<div class="msg err">{_bg_esc(err)}</div>'
 
@@ -3727,6 +3858,23 @@ async def bg_project_detail(project_id: str,
             "</form>"
         )
 
+    # Agent panel: company agents (org's approved company agents, invokable from
+    # here) + project agents (resident to this project).
+    owner_mem = _bg_get_membership(client, project.get("owner_id"))
+    proj_org_id = (owner_mem or {}).get("org", {}).get("id")
+    company_agents = []
+    project_agents = _bg_org_agents(client, proj_org_id, project_id=project_id) if proj_org_id else []
+    if proj_org_id:
+        all_company = _bg_org_agents(client, proj_org_id, agent_type="company")
+        # Show approved company agents plus any this user can still see; approved
+        # first so they are readily invokable.
+        company_agents = [a for a in all_company if (a.get("status") or "") == "approved"] \
+            + [a for a in all_company if (a.get("status") or "") != "approved"]
+    # project_agents above filtered by project_id but includes company type=NULL
+    # only for this project; ensure we only keep project-type rows.
+    project_agents = [a for a in project_agents if a.get("type") == "project"]
+    agents_panel = _bg_project_agents_panel(project_id, company_agents, project_agents)
+
     body = (
         '<div class="wrap" style="padding-bottom:4rem">'
         '<div style="padding-top:1.8rem">'
@@ -3744,6 +3892,7 @@ async def bg_project_detail(project_id: str,
         '<div class="section"><h2>Members</h2>'
         f"{members_table}</div>"
         f"{invite_form}"
+        f"{agents_panel}"
         "</div>"
     )
     return HTMLResponse(_bg_shell(project.get("name") or "Project", body, user))
@@ -4100,6 +4249,859 @@ async def bg_project_delete(project_id: str, request: Request,
         f"/build-guild/dashboard?deleted={quote_plus(project_name)}",
         status_code=303,
     )
+
+
+# ===========================================================================
+# Build Guild — Agent registry & messaging
+# ---------------------------------------------------------------------------
+# Each firm operates its own persistent agent on its own infrastructure. Build
+# Guild is the registry + protocol: humans register their firm's agent(s), Build
+# Guild verifies each by fetching its discovery card at
+# GET {agent_url}/.well-known/agent.json, and relays messages to it via
+# POST {agent_url}/messages.
+#
+#   Company agents  — one or many per organization, not bound to a project.
+#                     Created/approved by an org Admin.
+#   Project agents  — resident to a specific project. Created by any project
+#                     member (owner or member).
+#
+# Schema: see supabase/migrations/0001_agents.sql (agents, agent_messages,
+# organizations.domain). Authorization is enforced here in Python (the app uses
+# the anon key and mediates all access server-side); RLS is additionally enabled
+# on the tables.
+# ===========================================================================
+
+# Generic/consumer email providers are NOT used for domain auto-grouping — only
+# a firm's own domain identifies its organization.
+_BG_GENERIC_EMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "outlook.com",
+    "hotmail.com", "live.com", "msn.com", "aol.com", "icloud.com", "me.com",
+    "mac.com", "proton.me", "protonmail.com", "gmx.com", "zoho.com",
+    "yandex.com", "mail.com", "pm.me", "fastmail.com", "hey.com",
+}
+
+
+def _bg_email_domain(email: Optional[str]) -> Optional[str]:
+    """Return the lowercased domain of an email, or None if generic/invalid."""
+    if not email or "@" not in email:
+        return None
+    domain = email.rsplit("@", 1)[1].strip().lower()
+    if not domain or "." not in domain:
+        return None
+    if domain in _BG_GENERIC_EMAIL_DOMAINS:
+        return None
+    return domain
+
+
+def _bg_normalize_agent_url(url: str) -> str:
+    """Return the agent base URL (scheme+host[+path]) without trailing slash.
+
+    Accepts either a bare base URL or a full discovery/messages URL and strips
+    the well-known suffixes so we always store and call from the base.
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    u = u.rstrip("/")
+    for suffix in ("/.well-known/agent.json", "/.well-known/agent-manifest",
+                   "/messages", "/a2a"):
+        if u.endswith(suffix):
+            u = u[: -len(suffix)]
+            break
+    return u.rstrip("/")
+
+
+def _bg_fetch_discovery_card(agent_url: str):
+    """GET {agent_url}/.well-known/agent.json. Returns (ok, card_dict, error)."""
+    base = _bg_normalize_agent_url(agent_url)
+    if not base:
+        return False, None, "A valid agent URL is required."
+    try:
+        import requests
+        resp = requests.get(
+            base + "/.well-known/agent.json",
+            timeout=12,
+            headers={"Accept": "application/json",
+                     "User-Agent": "BuildGuild-Registry/1.0"},
+        )
+    except Exception as exc:
+        return False, None, f"Could not reach the agent: {exc}"
+    if resp.status_code != 200:
+        return False, None, (
+            f"Discovery card returned HTTP {resp.status_code}. "
+            "Check that the agent serves GET /.well-known/agent.json."
+        )
+    try:
+        card = resp.json()
+    except Exception:
+        return False, None, "Discovery card was not valid JSON."
+    if not isinstance(card, dict):
+        return False, None, "Discovery card must be a JSON object."
+    return True, card, ""
+
+
+def _bg_relay_agent_message(agent_url: str, payload: dict):
+    """POST {agent_url}/messages. Returns (ok, response_dict, error)."""
+    base = _bg_normalize_agent_url(agent_url)
+    if not base:
+        return False, None, "A valid agent URL is required."
+    try:
+        import requests
+        resp = requests.post(
+            base + "/messages",
+            json=payload,
+            timeout=30,
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json",
+                     "User-Agent": "BuildGuild-Relay/1.0"},
+        )
+    except Exception as exc:
+        return False, None, f"Could not reach the agent: {exc}"
+    if not (200 <= resp.status_code < 300):
+        return False, None, f"Agent returned HTTP {resp.status_code}."
+    try:
+        data = resp.json()
+    except Exception:
+        return False, None, "Agent reply was not valid JSON."
+    if not isinstance(data, dict):
+        return False, None, "Agent reply must be a JSON object."
+    return True, data, ""
+
+
+def _bg_agent_card_summary(card: Optional[dict]) -> str:
+    """Best-effort human summary of a discovery card's capabilities."""
+    if not isinstance(card, dict):
+        return ""
+    # A2A cards use "skills"; others use "capabilities"/"tools".
+    items = []
+    for key in ("skills", "capabilities", "tools"):
+        val = card.get(key)
+        if isinstance(val, list):
+            for it in val:
+                if isinstance(it, dict):
+                    nm = it.get("name") or it.get("id") or it.get("title")
+                    if nm:
+                        items.append(str(nm))
+                elif isinstance(it, str):
+                    items.append(it)
+        elif isinstance(val, dict):
+            items.extend(str(k) for k in val.keys())
+        if items:
+            break
+    return ", ".join(dict.fromkeys(items))[:240]
+
+
+def _bg_agent_status_badge(status: str) -> str:
+    """Return an HTML status pill for an agent status."""
+    s = (status or "pending").lower()
+    if s == "approved":
+        color = "#00ff88"
+    elif s == "offline":
+        color = "#f0a0a0"
+    else:  # pending
+        color = "#ffcc66"
+    label = {"approved": "Approved", "offline": "Offline",
+             "pending": "Pending"}.get(s, s.title())
+    return (
+        f'<span style="display:inline-block;font-size:.68rem;text-transform:uppercase;'
+        f'letter-spacing:.08em;color:{color};border:1px solid {color}55;border-radius:999px;'
+        f'padding:.15rem .55rem">{label}</span>'
+    )
+
+
+def _bg_try_domain_autojoin(client, user: dict) -> Optional[dict]:
+    """Auto-join a user to an organization whose domain matches their email.
+
+    Additive: only runs when the user has no membership yet. Returns the new
+    membership dict (same shape as _bg_get_membership) on success, else None so
+    callers fall back to the existing create/join-code chooser.
+    """
+    if client is None or not user:
+        return None
+    domain = _bg_email_domain(user.get("email"))
+    if not domain:
+        return None
+    try:
+        ores = (
+            client.table("organizations")
+            .select("id, name")
+            .ilike("domain", domain)
+            .limit(1)
+            .execute()
+        )
+        org = ores.data[0] if ores and ores.data else None
+    except Exception:
+        org = None
+    if not org:
+        return None
+    try:
+        client.table("organization_members").insert({
+            "org_id": org["id"],
+            "user_id": user["id"],
+            "email": (user.get("email") or "").lower(),
+            "role": "Member",
+            "status": "active",
+        }).execute()
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "duplicate" not in msg:
+            _guild_logger.warning(
+                "Domain auto-join failed for %s -> %s: %s",
+                user.get("email"), domain, exc,
+            )
+            return None
+    return _bg_get_membership(client, user["id"])
+
+
+def _bg_org_agents(client, org_id: str, agent_type: Optional[str] = None,
+                   project_id: Optional[str] = None) -> list:
+    """Fetch agents for an org, optionally filtered by type / project."""
+    if client is None or not org_id:
+        return []
+    try:
+        q = (
+            client.table("agents")
+            .select("id, name, type, org_id, project_id, created_by, agent_url, "
+                    "discovery_card, status, approved_at, last_ping, created_at")
+            .eq("org_id", org_id)
+        )
+        if agent_type:
+            q = q.eq("type", agent_type)
+        if project_id is not None:
+            q = q.eq("project_id", project_id)
+        res = q.order("created_at", desc=True).execute()
+        return res.data or []
+    except Exception as exc:
+        _guild_logger.warning("Load agents for org %s failed: %s", org_id, exc)
+        return []
+
+
+def _bg_get_agent(client, agent_id: str) -> Optional[dict]:
+    if client is None or not agent_id:
+        return None
+    try:
+        res = (
+            client.table("agents")
+            .select("id, name, type, org_id, project_id, created_by, agent_url, "
+                    "discovery_card, status, approved_at, last_ping, created_at")
+            .eq("id", agent_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res and res.data else None
+    except Exception:
+        return None
+
+
+def _bg_project_access(client, project_id: str, user: dict):
+    """Load a project and the caller's access to it.
+
+    Returns (project_or_None, is_member, can_manage). ``is_member`` is True when
+    the user owns the project or has a project_members row; ``can_manage`` when
+    the user may manage members (owner or same-org admin). Mirrors the checks in
+    bg_project_detail so agent routes share one source of truth.
+    """
+    if client is None or not project_id or not user:
+        return None, False, False
+    try:
+        pres = (
+            client.table("projects")
+            .select("id, name, description, location, owner_id, created_at")
+            .eq("id", project_id)
+            .limit(1)
+            .execute()
+        )
+        project = pres.data[0] if pres and pres.data else None
+    except Exception:
+        project = None
+    if not project:
+        return None, False, False
+    try:
+        mres = (
+            client.table("project_members")
+            .select("user_id")
+            .eq("project_id", project_id)
+            .execute()
+        )
+        members = mres.data or []
+    except Exception:
+        members = []
+    is_owner = project.get("owner_id") == user.get("id")
+    is_member = is_owner or any(m.get("user_id") == user.get("id") for m in members)
+    can_manage = _bg_can_manage_members(client, project, user)
+    return project, is_member, can_manage
+
+
+def _bg_verify_and_register_agent(client, *, name: str, agent_url: str,
+                                  agent_type: str, org_id: str,
+                                  project_id: Optional[str], created_by: str):
+    """Ping the discovery card and insert the agent row.
+
+    Returns (agent_row_or_None, error_message). On a successful discovery ping
+    the agent is stored as 'approved' with the cached card; otherwise it is
+    stored 'pending' and the caller can retry the ping later.
+    """
+    base = _bg_normalize_agent_url(agent_url)
+    ok, card, err = _bg_fetch_discovery_card(base)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    row = {
+        "name": name,
+        "type": agent_type,
+        "org_id": org_id,
+        "project_id": project_id,
+        "created_by": created_by,
+        "agent_url": base,
+        "discovery_card": card if ok else None,
+        "status": "approved" if ok else "pending",
+        "approved_at": now if ok else None,
+        "last_ping": now if ok else None,
+    }
+    try:
+        res = client.table("agents").insert(row).execute()
+        agent = res.data[0] if res and res.data else None
+    except Exception as exc:
+        return None, f"Could not save agent: {exc}"
+    if not agent:
+        return None, "Could not save agent. Please try again."
+    if not ok:
+        return agent, err
+    return agent, ""
+
+
+# ── Organization agent registry ──────────────────────────────────────────
+
+def _bg_org_agents_page(user: dict, org: dict, member_role: str, agents: list,
+                        notice: str = "") -> str:
+    is_admin = (member_role or "").lower() == "admin"
+    create_btn = ""
+    modal = ""
+    if is_admin:
+        create_btn = (
+            '<button class="btn primary sm" type="button" '
+            "onclick=\"document.getElementById('agentModal').style.display='flex'\">"
+            "+ Create Organization Agent</button>"
+        )
+        modal = (
+            '<div id="agentModal" style="display:none;position:fixed;inset:0;z-index:100;'
+            'background:rgba(0,0,0,.7);align-items:center;justify-content:center;padding:1rem">'
+            '<div class="card" style="max-width:460px;width:100%">'
+            "<h2>Create Organization Agent</h2>"
+            '<p class="sub" style="margin-bottom:1rem">Register a persistent agent your '
+            "firm operates. Build Guild verifies it by fetching its discovery card at "
+            "<code>/.well-known/agent.json</code>.</p>"
+            '<form method="post" action="/build-guild/org/agents/create">'
+            '<label for="ag_name">Agent name</label>'
+            '<input id="ag_name" name="name" type="text" required '
+            'placeholder="e.g. Zero Engineering Agent">'
+            '<label for="ag_url">Agent URL</label>'
+            '<input id="ag_url" name="agent_url" type="url" required '
+            'placeholder="https://your-agent.example.com">'
+            '<div style="height:1.2rem"></div>'
+            '<div class="row" style="justify-content:flex-end">'
+            '<button class="btn sm" type="button" '
+            "onclick=\"document.getElementById('agentModal').style.display='none'\">"
+            "Cancel</button>"
+            '<button class="btn primary sm" type="submit">Verify &amp; register</button>'
+            "</div></form></div></div>"
+        )
+
+    rows = []
+    for a in agents:
+        card = a.get("discovery_card") or {}
+        caps = _bg_agent_card_summary(card)
+        last_ping = a.get("last_ping") or ""
+        if last_ping:
+            last_ping = last_ping.replace("T", " ")[:16]
+        actions = (
+            '<form method="post" '
+            f'action="/build-guild/org/agents/{_bg_esc(a["id"])}/ping" style="display:inline;margin:0">'
+            '<button class="btn sm" type="submit">Ping / Re-verify</button></form>'
+        )
+        if is_admin and (a.get("status") or "") != "offline":
+            actions += (
+                ' <form method="post" '
+                f'action="/build-guild/org/agents/{_bg_esc(a["id"])}/deactivate" '
+                "onsubmit=\"return confirm('Deactivate this agent? It will be marked offline.')\" "
+                'style="display:inline;margin:0">'
+                '<button class="btn danger sm" type="submit">Deactivate</button></form>'
+            )
+        last_ping_cell = _bg_esc(last_ping) or '<span class="sub">never</span>'
+        caps_cell = _bg_esc(caps) or '<span class="sub">—</span>'
+        agent_url_val = _bg_esc(a.get("agent_url") or "")
+        rows.append(
+            "<tr>"
+            f"<td>{_bg_esc(a.get('name') or '—')}</td>"
+            f'<td><a href="{agent_url_val}" target="_blank" '
+            f'rel="noopener" style="word-break:break-all">{agent_url_val}</a></td>'
+            f"<td>{_bg_agent_status_badge(a.get('status'))}</td>"
+            f"<td>{last_ping_cell}</td>"
+            f"<td>{caps_cell}</td>"
+            f"<td>{actions}</td>"
+            "</tr>"
+        )
+    if rows:
+        table = (
+            "<table><thead><tr><th>Name</th><th>URL</th><th>Status</th>"
+            "<th>Last ping</th><th>Capabilities</th><th>Actions</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>"
+        )
+    else:
+        table = (
+            '<div class="empty">No organization agents yet.'
+            + ("<br>Click “Create Organization Agent” to register your firm’s agent."
+               if is_admin else "<br>An organization admin can register your firm’s agent.")
+            + "</div>"
+        )
+
+    body = (
+        '<div class="wrap" style="padding-top:1.6rem;padding-bottom:4rem">'
+        '<a class="backlink" href="/build-guild/dashboard">&larr; Back to dashboard</a>'
+        f"{notice}"
+        '<div class="pagehead" style="margin-top:1rem">'
+        f'<div><h1>Organization Agents</h1>'
+        f'<p class="sub" style="margin-bottom:0">Persistent agents operated by '
+        f'{_bg_esc(org.get("name") or "your organization")}</p></div>'
+        f"{create_btn}"
+        "</div>"
+        f"{table}"
+        f"{modal}"
+        "</div>"
+    )
+    return _bg_shell("Organization Agents", body, user)
+
+
+@app.get("/build-guild/org/agents", response_class=HTMLResponse)
+async def bg_org_agents(bg_session: Optional[str] = Cookie(default=None),
+                        notice: Optional[str] = None,
+                        err: Optional[str] = None):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    membership = _bg_get_membership(client, user["id"])
+    if not membership:
+        return RedirectResponse("/build-guild/org", status_code=303)
+    org = membership["org"]
+    agents = _bg_org_agents(client, org["id"], agent_type="company")
+    banner = ""
+    if notice:
+        banner = f'<div class="msg ok">{_bg_esc(notice)}</div>'
+    elif err:
+        banner = f'<div class="msg err">{_bg_esc(err)}</div>'
+    return HTMLResponse(_bg_org_agents_page(
+        user, org, membership["member_role"], agents, banner))
+
+
+@app.post("/build-guild/org/agents/create", response_class=HTMLResponse)
+async def bg_org_agents_create(request: Request,
+                               bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    if client is None:
+        return RedirectResponse("/build-guild/org/agents?err=Database+not+configured",
+                                status_code=303)
+    membership = _bg_get_membership(client, user["id"])
+    if not membership:
+        return RedirectResponse("/build-guild/org", status_code=303)
+    if (membership["member_role"] or "").lower() != "admin":
+        return RedirectResponse(
+            "/build-guild/org/agents?err=Only+an+organization+admin+can+create+company+agents",
+            status_code=303)
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    agent_url = (form.get("agent_url") or "").strip()
+    from urllib.parse import quote_plus
+    if not name or not agent_url:
+        return RedirectResponse(
+            "/build-guild/org/agents?err=" + quote_plus("Name and agent URL are required."),
+            status_code=303)
+
+    agent, err = _bg_verify_and_register_agent(
+        client, name=name, agent_url=agent_url, agent_type="company",
+        org_id=membership["org"]["id"], project_id=None, created_by=user["id"])
+    if agent is None:
+        return RedirectResponse("/build-guild/org/agents?err=" + quote_plus(err),
+                                status_code=303)
+    if err:
+        msg = ("Agent saved as pending — discovery verification failed: " + err
+               + " Use Ping / Re-verify once it is reachable.")
+        return RedirectResponse("/build-guild/org/agents?err=" + quote_plus(msg),
+                                status_code=303)
+    return RedirectResponse(
+        "/build-guild/org/agents?notice=" + quote_plus(
+            f"Agent “{name}” verified and approved."),
+        status_code=303)
+
+
+@app.post("/build-guild/org/agents/{agent_id}/ping")
+async def bg_org_agent_ping(agent_id: str,
+                            bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    from urllib.parse import quote_plus
+    membership = _bg_get_membership(client, user["id"]) if client else None
+    agent = _bg_get_agent(client, agent_id) if client else None
+    if not membership or not agent or agent.get("org_id") != membership["org"]["id"]:
+        return RedirectResponse("/build-guild/org/agents?err=Agent+not+found",
+                                status_code=303)
+    ok, card, err = _bg_fetch_discovery_card(agent.get("agent_url") or "")
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    update = {"last_ping": now}
+    if ok:
+        update.update({"status": "approved", "discovery_card": card,
+                       "approved_at": agent.get("approved_at") or now})
+        msg = "notice=" + quote_plus("Agent re-verified — reachable and approved.")
+    else:
+        # Only downgrade an approved agent to offline; keep pending as pending.
+        update["status"] = "offline" if agent.get("status") == "approved" else "pending"
+        msg = "err=" + quote_plus("Re-verify failed: " + err)
+    try:
+        client.table("agents").update(update).eq("id", agent_id).execute()
+    except Exception as exc:
+        msg = "err=" + quote_plus(f"Could not update agent: {exc}")
+    return RedirectResponse(f"/build-guild/org/agents?{msg}", status_code=303)
+
+
+@app.post("/build-guild/org/agents/{agent_id}/deactivate")
+async def bg_org_agent_deactivate(agent_id: str,
+                                  bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    from urllib.parse import quote_plus
+    membership = _bg_get_membership(client, user["id"]) if client else None
+    agent = _bg_get_agent(client, agent_id) if client else None
+    if not membership or not agent or agent.get("org_id") != membership["org"]["id"]:
+        return RedirectResponse("/build-guild/org/agents?err=Agent+not+found",
+                                status_code=303)
+    if (membership["member_role"] or "").lower() != "admin":
+        return RedirectResponse(
+            "/build-guild/org/agents?err=" + quote_plus(
+                "Only an organization admin can deactivate company agents."),
+            status_code=303)
+    try:
+        client.table("agents").update({"status": "offline"}).eq("id", agent_id).execute()
+    except Exception as exc:
+        return RedirectResponse(
+            "/build-guild/org/agents?err=" + quote_plus(f"Could not deactivate: {exc}"),
+            status_code=303)
+    return RedirectResponse(
+        "/build-guild/org/agents?notice=" + quote_plus("Agent deactivated (offline)."),
+        status_code=303)
+
+
+# ── Project agents: create / ping / deactivate / message thread ──────────
+
+@app.post("/build-guild/project/{project_id}/agents/create")
+async def bg_project_agent_create(project_id: str, request: Request,
+                                  bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    from urllib.parse import quote_plus
+    if client is None:
+        return RedirectResponse(f"/build-guild/project/{project_id}?err=Database+not+configured",
+                                status_code=303)
+    project, is_member, _ = _bg_project_access(client, project_id, user)
+    if not project or not is_member:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=" + quote_plus("You are not a member of this project."),
+            status_code=303)
+    # Resolve the org that owns this project (via the project owner's membership).
+    owner_mem = _bg_get_membership(client, project.get("owner_id"))
+    org_id = (owner_mem or {}).get("org", {}).get("id")
+    if not org_id:
+        # Fall back to the acting member's org.
+        acting = _bg_get_membership(client, user["id"])
+        org_id = (acting or {}).get("org", {}).get("id")
+    if not org_id:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=" + quote_plus("No organization found for this project."),
+            status_code=303)
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    agent_url = (form.get("agent_url") or "").strip()
+    if not name or not agent_url:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=" + quote_plus("Name and agent URL are required."),
+            status_code=303)
+
+    agent, err = _bg_verify_and_register_agent(
+        client, name=name, agent_url=agent_url, agent_type="project",
+        org_id=org_id, project_id=project_id, created_by=user["id"])
+    if agent is None:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=" + quote_plus(err), status_code=303)
+    if err:
+        msg = ("Project agent saved as pending — discovery verification failed: " + err)
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=" + quote_plus(msg), status_code=303)
+    return RedirectResponse(
+        f"/build-guild/project/{project_id}?agent_notice=" + quote_plus(
+            f"Project agent “{name}” verified and approved."),
+        status_code=303)
+
+
+@app.post("/build-guild/project/{project_id}/agents/{agent_id}/ping")
+async def bg_project_agent_ping(project_id: str, agent_id: str,
+                                bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    from urllib.parse import quote_plus
+    project, is_member, _ = _bg_project_access(client, project_id, user) if client else (None, False, False)
+    agent = _bg_get_agent(client, agent_id) if client else None
+    if not project or not is_member or not agent:
+        return RedirectResponse(f"/build-guild/project/{project_id}?err=Agent+not+found",
+                                status_code=303)
+    ok, card, err = _bg_fetch_discovery_card(agent.get("agent_url") or "")
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    update = {"last_ping": now}
+    if ok:
+        update.update({"status": "approved", "discovery_card": card,
+                       "approved_at": agent.get("approved_at") or now})
+        msg = "agent_notice=" + quote_plus("Agent re-verified — reachable and approved.")
+    else:
+        update["status"] = "offline" if agent.get("status") == "approved" else "pending"
+        msg = "err=" + quote_plus("Re-verify failed: " + err)
+    try:
+        client.table("agents").update(update).eq("id", agent_id).execute()
+    except Exception as exc:
+        msg = "err=" + quote_plus(f"Could not update agent: {exc}")
+    return RedirectResponse(f"/build-guild/project/{project_id}?{msg}", status_code=303)
+
+
+@app.post("/build-guild/project/{project_id}/agents/{agent_id}/deactivate")
+async def bg_project_agent_deactivate(project_id: str, agent_id: str,
+                                      bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    from urllib.parse import quote_plus
+    project, is_member, _ = _bg_project_access(client, project_id, user) if client else (None, False, False)
+    agent = _bg_get_agent(client, agent_id) if client else None
+    # Only allow deactivating project agents that belong to this project.
+    if (not project or not is_member or not agent
+            or agent.get("type") != "project"
+            or agent.get("project_id") != project_id):
+        return RedirectResponse(f"/build-guild/project/{project_id}?err=Agent+not+found",
+                                status_code=303)
+    try:
+        client.table("agents").update({"status": "offline"}).eq("id", agent_id).execute()
+    except Exception as exc:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=" + quote_plus(f"Could not deactivate: {exc}"),
+            status_code=303)
+    return RedirectResponse(
+        f"/build-guild/project/{project_id}?agent_notice=" + quote_plus("Agent deactivated (offline)."),
+        status_code=303)
+
+
+@app.get("/build-guild/project/{project_id}/agents/{agent_id}/thread",
+         response_class=HTMLResponse)
+async def bg_agent_thread(project_id: str, agent_id: str,
+                          err: Optional[str] = None,
+                          bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    if client is None:
+        return RedirectResponse(f"/build-guild/project/{project_id}?err=Database+not+configured",
+                                status_code=303)
+    project, is_member, _ = _bg_project_access(client, project_id, user)
+    agent = _bg_get_agent(client, agent_id)
+    if not project or not is_member or not agent:
+        return HTMLResponse(_bg_shell(
+            "Not found",
+            '<div class="wrap" style="padding-top:3rem"><div class="card">'
+            "<h1>Agent not found</h1>"
+            f'<a class="btn primary" href="/build-guild/project/{_bg_esc(project_id)}">Back to project</a>'
+            "</div></div>", user), status_code=404)
+    # A company agent must belong to the same org; a project agent to this project.
+    membership = _bg_get_membership(client, user["id"])
+    caller_org = (membership or {}).get("org", {}).get("id")
+    if agent.get("type") == "project" and agent.get("project_id") != project_id:
+        return RedirectResponse(f"/build-guild/project/{project_id}?err=Agent+not+found",
+                                status_code=303)
+    if agent.get("type") == "company" and agent.get("org_id") != caller_org:
+        return RedirectResponse(f"/build-guild/project/{project_id}?err=Agent+not+found",
+                                status_code=303)
+
+    # Load thread history for this agent within this project.
+    try:
+        mres = (
+            client.table("agent_messages")
+            .select("id, sender, from_firm, body, conversation_id, created_at")
+            .eq("agent_id", agent_id)
+            .eq("project_id", project_id)
+            .order("created_at", desc=False)
+            .execute()
+        )
+        msgs = mres.data or []
+    except Exception:
+        msgs = []
+
+    bubbles = []
+    for m in msgs:
+        is_user = (m.get("sender") or "") == "user"
+        align = "flex-end" if is_user else "flex-start"
+        bg = "var(--panel-hi)" if is_user else "var(--panel)"
+        who = "You" if is_user else (m.get("from_firm") or agent.get("name") or "Agent")
+        bubbles.append(
+            f'<div style="display:flex;justify-content:{align};margin:.4rem 0">'
+            f'<div style="max-width:80%;background:{bg};border:1px solid var(--border);'
+            f'border-radius:12px;padding:.6rem .85rem">'
+            f'<div style="font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;'
+            f'color:var(--faint);margin-bottom:.2rem">{_bg_esc(who)}</div>'
+            f'<div style="white-space:pre-wrap">{_bg_esc(m.get("body") or "")}</div>'
+            "</div></div>"
+        )
+    thread_html = ("".join(bubbles) if bubbles
+                   else '<p class="sub">No messages yet. Send the first message below.</p>')
+
+    notice = f'<div class="msg err">{_bg_esc(err)}</div>' if err else ""
+    card = agent.get("discovery_card") or {}
+    caps = _bg_agent_card_summary(card)
+    caps_html = (f'<p class="sub" style="margin-top:.3rem">Capabilities: {_bg_esc(caps)}</p>'
+                 if caps else "")
+    body = (
+        '<div class="wrap narrow" style="padding-top:1.6rem;padding-bottom:4rem;max-width:640px">'
+        f'<a class="backlink" href="/build-guild/project/{_bg_esc(project_id)}">&larr; Back to project</a>'
+        f"{notice}"
+        '<div class="pagehead" style="margin-top:1rem">'
+        f'<div><h1 style="font-size:1.35rem">{_bg_esc(agent.get("name") or "Agent")} '
+        f'{_bg_agent_status_badge(agent.get("status"))}</h1>'
+        f'<p class="sub" style="margin-bottom:0">{_bg_esc(agent.get("type","").title())} agent · '
+        f'{_bg_esc(agent.get("agent_url") or "")}</p>{caps_html}</div></div>'
+        '<div class="card" style="margin-top:1rem">'
+        f'<div style="max-height:52vh;overflow-y:auto;margin-bottom:1rem">{thread_html}</div>'
+        f'<form method="post" action="/build-guild/project/{_bg_esc(project_id)}/agents/{_bg_esc(agent_id)}/message">'
+        '<label for="msg">Message</label>'
+        '<textarea id="msg" name="message" required placeholder="Type a message to this agent…"></textarea>'
+        '<div style="height:.9rem"></div>'
+        '<button class="btn primary" type="submit">Send</button>'
+        "</form></div></div>"
+    )
+    return HTMLResponse(_bg_shell(f"{agent.get('name') or 'Agent'} — thread", body, user))
+
+
+@app.post("/build-guild/project/{project_id}/agents/{agent_id}/message")
+async def bg_agent_message(project_id: str, agent_id: str, request: Request,
+                           bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    from urllib.parse import quote_plus
+    thread_url = f"/build-guild/project/{project_id}/agents/{agent_id}/thread"
+    if client is None:
+        return RedirectResponse(thread_url + "?err=Database+not+configured", status_code=303)
+    project, is_member, _ = _bg_project_access(client, project_id, user)
+    agent = _bg_get_agent(client, agent_id)
+    membership = _bg_get_membership(client, user["id"])
+    caller_org = (membership or {}).get("org", {}).get("id")
+    caller_firm = (membership or {}).get("org", {}).get("name") or "Build Guild"
+    if not project or not is_member or not agent:
+        return RedirectResponse(f"/build-guild/project/{project_id}?err=Agent+not+found",
+                                status_code=303)
+    if agent.get("type") == "project" and agent.get("project_id") != project_id:
+        return RedirectResponse(f"/build-guild/project/{project_id}?err=Agent+not+found",
+                                status_code=303)
+    if agent.get("type") == "company" and agent.get("org_id") != caller_org:
+        return RedirectResponse(f"/build-guild/project/{project_id}?err=Agent+not+found",
+                                status_code=303)
+
+    form = await request.form()
+    message = (form.get("message") or "").strip()
+    if not message:
+        return RedirectResponse(thread_url, status_code=303)
+
+    # Find an existing conversation_id for this thread to continue it.
+    conv_id = None
+    try:
+        prev = (
+            client.table("agent_messages")
+            .select("conversation_id")
+            .eq("agent_id", agent_id)
+            .eq("project_id", project_id)
+            .not_.is_("conversation_id", None)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if prev and prev.data:
+            conv_id = prev.data[0].get("conversation_id")
+    except Exception:
+        conv_id = None
+
+    # Persist the user's message first.
+    try:
+        client.table("agent_messages").insert({
+            "agent_id": agent_id,
+            "project_id": project_id,
+            "conversation_id": conv_id,
+            "sender": "user",
+            "from_firm": caller_firm,
+            "body": message,
+            "created_by": user["id"],
+        }).execute()
+    except Exception as exc:
+        _guild_logger.warning("Persist user agent-message failed: %s", exc)
+
+    payload = {
+        "from_agent": f"Build Guild ({user.get('email') or 'member'})",
+        "from_firm": caller_firm,
+        "message": message,
+        "metadata": {"project_id": project_id, "project_name": project.get("name")},
+    }
+    if conv_id:
+        payload["conversation_id"] = conv_id
+
+    ok, data, err = _bg_relay_agent_message(agent.get("agent_url") or "", payload)
+    if not ok:
+        # Mark unreachable agent offline (best-effort) and report the error.
+        try:
+            client.table("agents").update({"status": "offline"}).eq("id", agent_id).execute()
+        except Exception:
+            pass
+        return RedirectResponse(thread_url + "?err=" + quote_plus("Agent did not reply: " + err),
+                                status_code=303)
+
+    reply = data.get("reply") or data.get("message") or "(no reply text)"
+    new_conv = data.get("conversation_id") or conv_id
+    reply_firm = data.get("from_firm") or agent.get("name") or "Agent"
+    try:
+        client.table("agent_messages").insert({
+            "agent_id": agent_id,
+            "project_id": project_id,
+            "conversation_id": new_conv,
+            "sender": "agent",
+            "from_firm": reply_firm,
+            "body": str(reply),
+            "created_by": user["id"],
+        }).execute()
+        # Backfill conversation_id on the user's row if it was newly assigned.
+        if new_conv and not conv_id:
+            client.table("agent_messages").update({"conversation_id": new_conv}) \
+                .eq("agent_id", agent_id).eq("project_id", project_id) \
+                .is_("conversation_id", None).execute()
+    except Exception as exc:
+        _guild_logger.warning("Persist agent reply failed: %s", exc)
+
+    return RedirectResponse(thread_url, status_code=303)
 
 
 # ---------------------------------------------------------------------------
@@ -5111,9 +6113,139 @@ def _run_a2a_migration() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Startup: agents / agent_messages schema migration (best-effort)
+# ---------------------------------------------------------------------------
+# Full, idempotent DDL for the agent registry. Mirrors
+# supabase/migrations/0001_agents.sql (kept in sync). Applied at startup via the
+# Supabase Management API when SUPABASE_ACCESS_TOKEN + SUPABASE_PROJECT_REF are
+# set; otherwise the SQL is logged to run manually. All code paths tolerate the
+# tables being absent, so a missing migration never crashes the app.
+_AGENTS_MIGRATION_SQL = """
+ALTER TABLE public.organizations ADD COLUMN IF NOT EXISTS domain text;
+CREATE INDEX IF NOT EXISTS organizations_domain_idx ON public.organizations (lower(domain));
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'agent_type') THEN
+    CREATE TYPE agent_type AS ENUM ('company', 'project');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'agent_status') THEN
+    CREATE TYPE agent_status AS ENUM ('pending', 'approved', 'offline');
+  END IF;
+END$$;
+
+CREATE TABLE IF NOT EXISTS public.agents (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL,
+  type agent_type NOT NULL,
+  org_id uuid NOT NULL REFERENCES public.organizations(id) ON DELETE CASCADE,
+  project_id uuid REFERENCES public.projects(id) ON DELETE CASCADE,
+  created_by uuid NOT NULL REFERENCES auth.users(id),
+  agent_url text NOT NULL,
+  discovery_card jsonb,
+  status agent_status NOT NULL DEFAULT 'pending',
+  approved_at timestamptz,
+  last_ping timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS agents_org_id_idx ON public.agents (org_id);
+CREATE INDEX IF NOT EXISTS agents_project_id_idx ON public.agents (project_id);
+
+CREATE TABLE IF NOT EXISTS public.agent_messages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id uuid NOT NULL REFERENCES public.agents(id) ON DELETE CASCADE,
+  project_id uuid REFERENCES public.projects(id) ON DELETE CASCADE,
+  conversation_id text,
+  sender text NOT NULL,
+  from_firm text,
+  body text NOT NULL,
+  created_by uuid REFERENCES auth.users(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS agent_messages_agent_id_idx ON public.agent_messages (agent_id, created_at);
+CREATE INDEX IF NOT EXISTS agent_messages_conversation_idx ON public.agent_messages (conversation_id);
+
+ALTER TABLE public.agents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.agent_messages ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS agents_select_org_members ON public.agents;
+CREATE POLICY agents_select_org_members ON public.agents FOR SELECT TO authenticated
+  USING (EXISTS (SELECT 1 FROM public.organization_members m WHERE m.org_id = agents.org_id AND m.user_id = auth.uid()));
+
+DROP POLICY IF EXISTS agents_insert_company_admin ON public.agents;
+CREATE POLICY agents_insert_company_admin ON public.agents FOR INSERT TO authenticated
+  WITH CHECK (created_by = auth.uid() AND (
+    (type = 'company' AND project_id IS NULL AND EXISTS (
+       SELECT 1 FROM public.organization_members m WHERE m.org_id = agents.org_id AND m.user_id = auth.uid() AND lower(m.role) = 'admin'))
+    OR (type = 'project' AND project_id IS NOT NULL AND (
+       EXISTS (SELECT 1 FROM public.projects p WHERE p.id = agents.project_id AND p.owner_id = auth.uid())
+       OR EXISTS (SELECT 1 FROM public.project_members pm WHERE pm.project_id = agents.project_id AND pm.user_id = auth.uid())))));
+
+DROP POLICY IF EXISTS agents_update_authorized ON public.agents;
+CREATE POLICY agents_update_authorized ON public.agents FOR UPDATE TO authenticated
+  USING (
+    (type = 'company' AND EXISTS (SELECT 1 FROM public.organization_members m WHERE m.org_id = agents.org_id AND m.user_id = auth.uid() AND lower(m.role) = 'admin'))
+    OR (type = 'project' AND (
+       EXISTS (SELECT 1 FROM public.projects p WHERE p.id = agents.project_id AND p.owner_id = auth.uid())
+       OR EXISTS (SELECT 1 FROM public.project_members pm WHERE pm.project_id = agents.project_id AND pm.user_id = auth.uid())
+       OR EXISTS (SELECT 1 FROM public.organization_members m WHERE m.org_id = agents.org_id AND m.user_id = auth.uid() AND lower(m.role) = 'admin'))));
+
+DROP POLICY IF EXISTS agent_messages_select_org ON public.agent_messages;
+CREATE POLICY agent_messages_select_org ON public.agent_messages FOR SELECT TO authenticated
+  USING (EXISTS (SELECT 1 FROM public.agents a JOIN public.organization_members m ON m.org_id = a.org_id WHERE a.id = agent_messages.agent_id AND m.user_id = auth.uid()));
+
+DROP POLICY IF EXISTS agent_messages_insert_org ON public.agent_messages;
+CREATE POLICY agent_messages_insert_org ON public.agent_messages FOR INSERT TO authenticated
+  WITH CHECK (EXISTS (SELECT 1 FROM public.agents a JOIN public.organization_members m ON m.org_id = a.org_id WHERE a.id = agent_messages.agent_id AND m.user_id = auth.uid()));
+
+DROP POLICY IF EXISTS agents_app_all ON public.agents;
+CREATE POLICY agents_app_all ON public.agents FOR ALL TO anon USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS agent_messages_app_all ON public.agent_messages;
+CREATE POLICY agent_messages_app_all ON public.agent_messages FOR ALL TO anon USING (true) WITH CHECK (true);
+"""
+
+
+def _run_agents_migration() -> None:
+    """Best-effort apply of the agents schema via the Supabase Management API."""
+    project_ref = os.environ.get("SUPABASE_PROJECT_REF")
+    mgmt_token = os.environ.get("SUPABASE_ACCESS_TOKEN")
+    if project_ref and mgmt_token:
+        try:
+            import urllib.request
+
+            url = f"https://api.supabase.com/v1/projects/{project_ref}/database/query"
+            body = json.dumps({"query": _AGENTS_MIGRATION_SQL}).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={
+                    "Authorization": f"Bearer {mgmt_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status in (200, 201):
+                    _guild_logger.info(
+                        "Agents migration applied via Supabase Management API."
+                    )
+                    return
+        except Exception as exc:
+            _guild_logger.warning(
+                "Agents migration via Management API failed: %s", exc
+            )
+    _guild_logger.warning(
+        "Agents migration NOT applied automatically. Run "
+        "supabase/migrations/0001_agents.sql in the Supabase SQL editor."
+    )
+
+
 @app.on_event("startup")
 async def _a2a_startup():
     try:
         _run_a2a_migration()
     except Exception as exc:  # never let migration crash startup
         _guild_logger.warning("A2A startup migration skipped: %s", exc)
+    try:
+        _run_agents_migration()
+    except Exception as exc:  # never let migration crash startup
+        _guild_logger.warning("Agents startup migration skipped: %s", exc)
