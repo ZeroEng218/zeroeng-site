@@ -3346,7 +3346,9 @@ def _bg_user_projects(client, user_id: str) -> list:
 
 
 @app.get("/build-guild/dashboard", response_class=HTMLResponse)
-async def bg_dashboard(bg_session: Optional[str] = Cookie(default=None)):
+async def bg_dashboard(bg_session: Optional[str] = Cookie(default=None),
+                       deleted: Optional[str] = None,
+                       err: Optional[str] = None):
     user = _bg_get_current_user(bg_session)
     if not user:
         return RedirectResponse("/build-guild/login", status_code=303)
@@ -3408,8 +3410,15 @@ async def bg_dashboard(bg_session: Optional[str] = Cookie(default=None)):
             'Create your first project to start collaborating with credentialed agents and members.</div>'
         )
 
+    dash_notice = ""
+    if deleted:
+        dash_notice = f'<div class="msg ok">Project &ldquo;{_bg_esc(deleted)}&rdquo; was deleted.</div>'
+    elif err:
+        dash_notice = f'<div class="msg err">{_bg_esc(err)}</div>'
+
     body = (
         '<div class="wrap" style="padding-top:1.6rem;padding-bottom:4rem">'
+        f"{dash_notice}"
         f"{org_banner}"
         '<div class="pagehead">'
         f"<div><h1>Welcome, {_bg_esc(name)}</h1>"
@@ -3701,6 +3710,23 @@ async def bg_project_detail(project_id: str,
 
     loc = project.get("location")
     loc_html = f'<div class="tag">{_bg_esc(loc)}</div>' if loc else ""
+
+    delete_btn = ""
+    if is_owner:
+        proj_name_js = (project.get("name") or "this project").replace("'", "\\'")
+        delete_confirm_js = (
+            f"return confirm('Delete \\'{proj_name_js}\\'? "
+            "This will permanently remove the project and all its members. "
+            "This cannot be undone.')"
+        )
+        delete_btn = (
+            f'<form method="post" '
+            f'action="/build-guild/project/{_bg_esc(project_id)}/delete" '
+            f'onsubmit="{delete_confirm_js}" style="margin:0">'
+            '<button class="btn danger sm" type="submit">Delete project</button>'
+            "</form>"
+        )
+
     body = (
         '<div class="wrap" style="padding-bottom:4rem">'
         '<div style="padding-top:1.8rem">'
@@ -3710,7 +3736,10 @@ async def bg_project_detail(project_id: str,
         f'<div><h1>{_bg_esc(project.get("name") or "Untitled project")}</h1>'
         f'<p class="sub" style="margin-bottom:0">{_bg_esc(project.get("description") or "No description yet.")}</p>'
         f"{loc_html}</div>"
+        f'<div style="display:flex;align-items:center;gap:.6rem">'
         f'<div class="tag">{"Owner" if is_owner else "Member"}</div>'
+        f"{delete_btn}"
+        "</div>"
         "</div>"
         '<div class="section"><h2>Members</h2>'
         f"{members_table}</div>"
@@ -4009,6 +4038,68 @@ async def bg_project_remove_member(project_id: str, request: Request,
     )
 
 
+@app.post("/build-guild/project/{project_id}/delete")
+async def bg_project_delete(project_id: str, request: Request,
+                            bg_session: Optional[str] = Cookie(default=None)):
+    """Permanently delete a project.  Only the project owner may do this."""
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    if client is None:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=Database+not+configured",
+            status_code=303,
+        )
+
+    # Load the project to verify ownership.
+    try:
+        pres = (
+            client.table("projects")
+            .select("id, name, owner_id")
+            .eq("id", project_id)
+            .limit(1)
+            .execute()
+        )
+        project = pres.data[0] if pres and pres.data else None
+    except Exception:
+        project = None
+    if not project:
+        return RedirectResponse("/build-guild/dashboard", status_code=303)
+
+    if project.get("owner_id") != user["id"]:
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=Only+the+project+owner+can+delete+it",
+            status_code=303,
+        )
+
+    project_name = project.get("name") or "Project"
+
+    # Delete all member rows first (avoids FK constraint violations).
+    try:
+        client.table("project_members").delete().eq("project_id", project_id).execute()
+    except Exception as exc:
+        _guild_logger.error("Delete project %s members failed: %s", project_id, exc)
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=Could+not+delete+project+members",
+            status_code=303,
+        )
+
+    # Delete the project itself.
+    try:
+        client.table("projects").delete().eq("id", project_id).execute()
+    except Exception as exc:
+        _guild_logger.error("Delete project %s failed: %s", project_id, exc)
+        return RedirectResponse(
+            f"/build-guild/project/{project_id}?err=Could+not+delete+project",
+            status_code=303,
+        )
+
+    from urllib.parse import quote_plus
+    return RedirectResponse(
+        f"/build-guild/dashboard?deleted={quote_plus(project_name)}",
+        status_code=303,
+    )
 
 
 # ---------------------------------------------------------------------------
