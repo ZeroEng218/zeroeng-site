@@ -2581,7 +2581,7 @@ def _bg_ensure_profile(client, user: dict) -> dict:
         res = (
             client.table("user_profiles")
             .select("id, email, display_name, org_name, role")
-            .eq("id", user["id"])
+            .eq("user_id", user["id"])
             .limit(1)
             .execute()
         )
@@ -2591,7 +2591,7 @@ def _bg_ensure_profile(client, user: dict) -> dict:
     if row:
         return row
     profile = {
-        "id": user["id"],
+        "user_id": user["id"],
         "email": user.get("email"),
         "display_name": (user.get("email") or "").split("@")[0] or "Member",
     }
@@ -2908,7 +2908,7 @@ async def bg_signup_submit(request: Request):
         try:
             client.table("user_profiles").upsert(
                 {
-                    "id": user.id,
+                    "user_id": user.id,
                     "email": email,
                     "display_name": display_name or email.split("@")[0],
                     "org_name": org_name or None,
