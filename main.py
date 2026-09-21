@@ -4808,7 +4808,7 @@ async def bg_org_agent_deactivate(agent_id: str,
 # (e.g. "Procurement", "Safety", "Project Management"). Any member of the org
 # may manage them; agents acting on behalf of the org consume them at runtime.
 
-_MCP_CONN_COLS = ("id, org_id, name, description, url, created_by, "
+_MCP_CONN_COLS = ("id, org_id, name, description, url, token, created_by, "
                   "created_at, updated_at")
 
 
@@ -4864,10 +4864,10 @@ def _bg_org_mcp_page(user: dict, org: dict, member_role: str, connections: list,
         'background:rgba(0,0,0,.7);align-items:center;justify-content:center;padding:1rem">'
         '<div class="card" style="max-width:460px;width:100%">'
         "<h2>Add MCP Connection</h2>"
-        '<p class="sub" style="margin-bottom:1rem">Register an MCP connection URL '
-        "your team plugs into an LLM connector to query Build Guild on behalf of "
-        "this organization. Give it a name so callers know what it pertains to "
-        "(e.g. Procurement, Safety, Project Management).</p>"
+        '<p class="sub" style="margin-bottom:1rem">Create an MCP connection your team '
+        "plugs into an LLM connector to query Build Guild on behalf of this "
+        "organization. Just give it a name (e.g. Procurement, Safety, Project "
+        "Management) &mdash; Build Guild generates a unique connection URL for you.</p>"
         '<form method="post" action="/build-guild/org/mcp-connections/create">'
         '<label for="mcp_name">Name</label>'
         '<input id="mcp_name" name="name" type="text" required '
@@ -4875,9 +4875,6 @@ def _bg_org_mcp_page(user: dict, org: dict, member_role: str, connections: list,
         '<label for="mcp_desc">Description <span class="sub">(optional)</span></label>'
         '<input id="mcp_desc" name="description" type="text" '
         'placeholder="What this connection is for">'
-        '<label for="mcp_url">Connection URL</label>'
-        '<input id="mcp_url" name="url" type="url" required '
-        'placeholder="https://mcp.zeroeng.io/...">'
         '<div style="height:1.2rem"></div>'
         '<div class="row" style="justify-content:flex-end">'
         '<button class="btn sm" type="button" '
@@ -4944,8 +4941,9 @@ def _bg_org_mcp_page(user: dict, org: dict, member_role: str, connections: list,
             f'<input name="name" type="text" required value="{name}">'
             '<label>Description <span class="sub">(optional)</span></label>'
             f'<input name="description" type="text" value="{desc}">'
-            '<label>Connection URL</label>'
-            f'<input name="url" type="url" required value="{url_val}">'
+            '<label>Connection URL <span class="sub">(generated &mdash; read only)</span></label>'
+            f'<input type="text" value="{url_val}" readonly '
+            'style="background:rgba(255,255,255,.05);color:#9aa4b2;cursor:not-allowed">'
             '<div style="height:1.2rem"></div>'
             '<div class="row" style="justify-content:flex-end">'
             '<button class="btn sm" type="button" '
@@ -5041,18 +5039,22 @@ async def bg_org_mcp_create(request: Request,
     form = await request.form()
     name = (form.get("name") or "").strip()
     description = (form.get("description") or "").strip()
-    url = (form.get("url") or "").strip()
-    if not name or not url:
+    if not name:
         return RedirectResponse(
             "/build-guild/org/mcp-connections?err="
-            + quote_plus("Name and connection URL are required."),
+            + quote_plus("A name is required."),
             status_code=303)
 
+    # Build Guild mints a unique, identity-bearing URL for each connection.
+    token = secrets_mod.token_urlsafe(24)
+    base = _bg_base_url(request)
+    url = f"{base}/build-guild/mcp/{token}"
     row = {
         "org_id": membership["org"]["id"],
         "name": name,
         "description": description or None,
         "url": url,
+        "token": token,
         "created_by": user["id"],
     }
     try:
@@ -5087,14 +5089,15 @@ async def bg_org_mcp_edit(conn_id: str, request: Request,
     form = await request.form()
     name = (form.get("name") or "").strip()
     description = (form.get("description") or "").strip()
-    url = (form.get("url") or "").strip()
-    if not name or not url:
+    if not name:
         return RedirectResponse(
             "/build-guild/org/mcp-connections?err="
-            + quote_plus("Name and connection URL are required."),
+            + quote_plus("A name is required."),
             status_code=303)
 
-    update = {"name": name, "description": description or None, "url": url}
+    # The connection URL / token are immutable so existing connectors keep
+    # working; only the label and description can be edited.
+    update = {"name": name, "description": description or None}
     try:
         client.table("mcp_connections").update(update).eq("id", conn_id).execute()
     except Exception as exc:
@@ -5166,6 +5169,55 @@ async def bg_org_mcp_connections_json(org_id: str,
             }
             for c in connections
         ],
+    })
+
+
+@app.get("/build-guild/mcp/{token}")
+async def bg_mcp_resolve(token: str):
+    """Resolve a minted MCP connection URL to the org identity it represents.
+
+    This is the public endpoint that each generated connection URL points at.
+    An LLM connector hits it to discover which organization (and which named
+    connection) the caller is acting on behalf of. Returns a compact identity
+    document, or 404 if the token is unknown.
+    """
+    client = get_supabase()
+    if client is None:
+        return JSONResponse({"ok": False, "error": "unavailable"}, status_code=503)
+    conn = None
+    try:
+        res = (
+            client.table("mcp_connections")
+            .select(_MCP_CONN_COLS)
+            .eq("token", token)
+            .limit(1)
+            .execute()
+        )
+        conn = res.data[0] if res and res.data else None
+    except Exception as exc:
+        _guild_logger.warning("MCP token resolve failed: %s", exc)
+        return JSONResponse({"ok": False, "error": "error"}, status_code=500)
+    if not conn:
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    org = None
+    try:
+        ores = (
+            client.table("organizations")
+            .select("id, name")
+            .eq("id", conn.get("org_id"))
+            .limit(1)
+            .execute()
+        )
+        org = ores.data[0] if ores and ores.data else None
+    except Exception:
+        org = None
+    return JSONResponse({
+        "ok": True,
+        "org_id": conn.get("org_id"),
+        "org_name": (org or {}).get("name"),
+        "connection_id": conn.get("id"),
+        "connection_name": conn.get("name"),
+        "connection_description": conn.get("description"),
     })
 
 
