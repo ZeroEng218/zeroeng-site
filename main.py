@@ -698,6 +698,38 @@ TOOLS = [
             "required": ["project_credential"],
         },
     },
+    {
+        "name": "ask_build_guild",
+        "description": (
+            "Ask The Build Guild a natural-language question. Two kinds of "
+            "questions are answered:\n"
+            "1) Public marketplace statistics — e.g. 'how many vendors are in "
+            "the marketplace?', 'how many organizations are registered?', "
+            "'how many agents are online?'. These are answered directly from "
+            "the Build Guild's own data; no credential required.\n"
+            "2) Questions about a specific registered organization — e.g. "
+            "'who is Independence Waste?' or 'does Acme Engineering handle "
+            "concrete work?'. If that organization has registered a persistent "
+            "agent, the Build Guild forwards your question to that agent "
+            "(including the identity of your connection) and returns its reply. "
+            "If the named organization has no reachable agent, a helpful notice "
+            "is returned instead."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "A natural-language question, either about aggregate "
+                        "marketplace statistics or about a specific registered "
+                        "organization by name."
+                    ),
+                },
+            },
+            "required": ["question"],
+        },
+    },
 ]
 
 
@@ -1926,8 +1958,14 @@ def osm_lookup(lat, lon, radius_meters=200, categories=None) -> dict:
     )
 
 
-def _handle_rpc(message: dict, server_info: Optional[dict] = None) -> Optional[dict]:
-    """Handle a single JSON-RPC message. Returns None for notifications."""
+def _handle_rpc(message: dict, server_info: Optional[dict] = None,
+                caller_identity: Optional[dict] = None) -> Optional[dict]:
+    """Handle a single JSON-RPC message. Returns None for notifications.
+
+    ``caller_identity`` (when present) describes the organization whose MCP
+    connection token was used to reach this server — see ``bg_mcp_rpc``. It is
+    None for the public, token-less ``/mcp`` endpoint (anonymous caller).
+    """
     msg_id = message.get("id")
     method = message.get("method")
     params = message.get("params") or {}
@@ -1976,19 +2014,31 @@ def _handle_rpc(message: dict, server_info: Optional[dict] = None) -> Optional[d
                     arguments.get("search"),
                 ),
             )
+        if name == "ask_build_guild":
+            return _rpc_result(
+                msg_id,
+                ask_build_guild_tool(
+                    arguments.get("question"),
+                    caller_identity=caller_identity,
+                ),
+            )
         return _rpc_error(msg_id, -32602, f"Unknown tool: {name}")
 
     return _rpc_error(msg_id, -32601, f"Method not found: {method}")
 
 
 async def _process_mcp_request(request: Request,
-                               server_info: Optional[dict] = None) -> JSONResponse:
+                               server_info: Optional[dict] = None,
+                               caller_identity: Optional[dict] = None) -> JSONResponse:
     """Parse a JSON-RPC request body and dispatch it (single or batch).
 
     Shared by the public ``/mcp`` endpoint and the per-connection
     ``/build-guild/mcp/{token}`` endpoint so both speak the same
     Streamable-HTTP JSON-RPC 2.0 transport that MCP clients (Claude, Cursor,
     Abacus, etc.) expect.
+
+    ``caller_identity`` is forwarded to every message handler so tools can tell
+    which organization is calling (None = anonymous / public endpoint).
     """
     try:
         payload = await request.json()
@@ -1999,7 +2049,8 @@ async def _process_mcp_request(request: Request,
 
     # Support both a single message and a batch.
     if isinstance(payload, list):
-        responses = [r for r in (_handle_rpc(m, server_info) for m in payload)
+        responses = [r for r in (_handle_rpc(m, server_info, caller_identity)
+                                 for m in payload)
                      if r is not None]
         if not responses:
             return JSONResponse(content=None, status_code=202)
@@ -2010,7 +2061,7 @@ async def _process_mcp_request(request: Request,
             _rpc_error(None, -32600, "Invalid Request"), status_code=400
         )
 
-    response = _handle_rpc(payload, server_info)
+    response = _handle_rpc(payload, server_info, caller_identity)
     if response is None:
         # Notification -- acknowledge with no body.
         return JSONResponse(content=None, status_code=202)
@@ -5299,7 +5350,17 @@ async def bg_mcp_rpc(token: str, request: Request):
         "name": f"zeroeng-mcp ({org_name}: {conn_name})",
         "version": SERVER_INFO.get("version", "1.0.0"),
     }
-    return await _process_mcp_request(request, server_info=server_info)
+    # Identity of the org whose connection token was used. Threaded through to
+    # tool handlers (e.g. ask_build_guild) so tools know who is calling and can
+    # forward that identity to downstream org agents.
+    caller_identity = {
+        "org_id": conn.get("org_id"),
+        "org_name": (org or {}).get("name"),
+        "conn_id": conn.get("id"),
+        "conn_name": conn.get("name"),
+    }
+    return await _process_mcp_request(request, server_info=server_info,
+                                      caller_identity=caller_identity)
 
 
 # ── Project agents: create / ping / deactivate / message thread ──────────
@@ -5770,6 +5831,296 @@ def find_agents_tool(project_credential: Any, role: Any = None,
     lines.append("")
     lines.append(json.dumps({"members": members}))
     return _tool_text("\n".join(lines), is_error=False)
+
+
+# ---------------------------------------------------------------------------
+# ask_build_guild — tiered natural-language Q&A over the Guild
+# ---------------------------------------------------------------------------
+# Tier 0: public marketplace statistics answered directly from Supabase.
+# Tier 1: questions naming a registered org are forwarded to that org's
+#         persistent agent (A2A), carrying the caller's identity.
+# ---------------------------------------------------------------------------
+
+# Words that signal the caller wants an aggregate count / statistic.
+_ASK_STAT_INTENT = (
+    "how many", "how much", "number of", "count", "total", "tally",
+    "statistic", "stats", "count of",
+)
+
+# Map role keywords -> canonical guild role for role-scoped counts.
+_ASK_ROLE_KEYWORDS = {
+    "vendor": "Vendor",
+    "supplier": "Vendor",
+    "architect": "Architect",
+    "engineer": "Engineer",
+    "contractor": "Contractor",
+    "owner": "Owner",
+}
+
+
+def _bg_count_table(client, table: str, filters: Optional[dict] = None) -> Optional[int]:
+    """Return an exact row count for a table (with optional eq filters), or None."""
+    try:
+        q = client.table(table).select("id", count="exact")
+        for col, val in (filters or {}).items():
+            q = q.eq(col, val)
+        resp = q.limit(1).execute()
+        cnt = getattr(resp, "count", None)
+        if cnt is None:
+            # Fall back to len(data) if the driver didn't populate count.
+            cnt = len(getattr(resp, "data", None) or [])
+        return int(cnt)
+    except Exception as exc:
+        _guild_logger.warning("Count query on %s failed: %s", table, exc)
+        return None
+
+
+def _bg_count_guild_members(client, role: Optional[str] = None) -> Optional[int]:
+    """Count registered marketplace members (guild_members), optionally by role."""
+    try:
+        q = client.table("guild_members").select("org_name", count="exact")
+        if role:
+            q = q.eq("role", role)
+        resp = q.limit(1).execute()
+        cnt = getattr(resp, "count", None)
+        if cnt is None:
+            cnt = len(getattr(resp, "data", None) or [])
+        return int(cnt)
+    except Exception as exc:
+        _guild_logger.warning("guild_members count failed: %s", exc)
+        return None
+
+
+def _ask_tier0_answer(client, question: str) -> Optional[str]:
+    """Answer a platform-statistics question, or None if it isn't one."""
+    q = (question or "").lower()
+    if not any(kw in q for kw in _ASK_STAT_INTENT):
+        return None
+
+    # Role-scoped marketplace counts (e.g. "how many vendors").
+    for kw, canonical in _ASK_ROLE_KEYWORDS.items():
+        if kw in q:
+            cnt = _bg_count_guild_members(client, role=canonical)
+            if cnt is None:
+                return ("I couldn't read the marketplace registry just now, so "
+                        f"I can't give a reliable {canonical.lower()} count.")
+            noun = canonical.lower()
+            if cnt != 1:
+                noun += "s"
+            return (f"There {'is' if cnt == 1 else 'are'} {cnt} "
+                    f"{noun} registered in the Build Guild marketplace.")
+
+    # Agent counts.
+    if "agent" in q:
+        online_words = ("online", "approved", "active", "reachable")
+        if any(w in q for w in online_words):
+            cnt = _bg_count_table(client, "agents", {"status": "approved"})
+            label = "approved (online)"
+        else:
+            cnt = _bg_count_table(client, "agents")
+            label = "registered"
+        if cnt is None:
+            return "I couldn't read the agent registry just now."
+        return (f"There {'is' if cnt == 1 else 'are'} {cnt} {label} "
+                f"agent{'' if cnt == 1 else 's'} in the Build Guild.")
+
+    # General marketplace / organization / member / vendor-neutral counts.
+    general_words = ("vendor", "member", "organization", "organisation", "org",
+                     "company", "companies", "firm", "marketplace", "registered",
+                     "participant", "business")
+    if any(w in q for w in general_words):
+        cnt = _bg_count_guild_members(client)
+        if cnt is None:
+            return "I couldn't read the marketplace registry just now."
+        return (f"There {'is' if cnt == 1 else 'are'} {cnt} "
+                f"organization{'' if cnt == 1 else 's'} registered in the "
+                f"Build Guild marketplace.")
+
+    return None
+
+
+def _ask_collect_org_names(client) -> list:
+    """Return a de-duplicated list of known org names (guild_members + organizations)."""
+    names = set()
+    for table, col in (("guild_members", "org_name"), ("organizations", "name")):
+        try:
+            resp = client.table(table).select(col).execute()
+            for r in (getattr(resp, "data", None) or []):
+                nm = (r.get(col) or "").strip()
+                if nm:
+                    names.add(nm)
+        except Exception as exc:
+            _guild_logger.warning("Org-name scan on %s failed: %s", table, exc)
+    return list(names)
+
+
+def _ask_match_org(question: str, org_names: list) -> Optional[str]:
+    """Return the longest registered org name that appears in the question."""
+    q = (question or "").lower()
+    best = None
+    for nm in org_names:
+        nml = nm.lower()
+        if len(nml) >= 3 and nml in q:
+            if best is None or len(nm) > len(best):
+                best = nm
+    return best
+
+
+def _ask_find_org_agent(client, org_name: str):
+    """Find a reachable persistent agent endpoint for a named org.
+
+    Returns (endpoint_url, source_label) or (None, None). Prefers an approved
+    company agent in the `agents` table; falls back to a guild_members
+    a2a_endpoint.
+    """
+    # 1) organizations -> agents (approved company agent).
+    try:
+        ores = (
+            client.table("organizations")
+            .select("id, name")
+            .ilike("name", org_name)
+            .limit(1)
+            .execute()
+        )
+        org_row = (getattr(ores, "data", None) or [None])[0]
+    except Exception as exc:
+        _guild_logger.warning("Org lookup for '%s' failed: %s", org_name, exc)
+        org_row = None
+
+    if org_row and org_row.get("id"):
+        try:
+            ares = (
+                client.table("agents")
+                .select("id, name, agent_url, type, status")
+                .eq("org_id", org_row["id"])
+                .eq("type", "company")
+                .execute()
+            )
+            agents = getattr(ares, "data", None) or []
+            # Prefer approved, then any.
+            approved = [a for a in agents if a.get("status") == "approved"]
+            chosen = (approved or agents or [None])[0]
+            if chosen and chosen.get("agent_url"):
+                return chosen["agent_url"], "persistent agent"
+        except Exception as exc:
+            _guild_logger.warning("Agent lookup for org '%s' failed: %s",
+                                  org_name, exc)
+
+    # 2) guild_members a2a_endpoint fallback.
+    try:
+        gres = (
+            client.table("guild_members")
+            .select("org_name, a2a_endpoint")
+            .ilike("org_name", org_name)
+            .limit(1)
+            .execute()
+        )
+        grow = (getattr(gres, "data", None) or [None])[0]
+        if grow and grow.get("a2a_endpoint"):
+            return grow["a2a_endpoint"], "registered A2A endpoint"
+    except Exception as exc:
+        _guild_logger.warning("guild_members a2a lookup for '%s' failed: %s",
+                              org_name, exc)
+
+    return None, None
+
+
+def _ask_tier1_answer(client, question: str,
+                      caller_identity: Optional[dict]) -> Optional[str]:
+    """Route a question about a named org to that org's agent, or None."""
+    org_names = _ask_collect_org_names(client)
+    if not org_names:
+        return None
+    matched = _ask_match_org(question, org_names)
+    if not matched:
+        return None
+
+    endpoint, source = _ask_find_org_agent(client, matched)
+    if not endpoint:
+        return (f"'{matched}' is a recognized name, but it has no reachable "
+                f"agent registered with the Build Guild, so I can't forward your "
+                f"question to them. You can use find_agents to see their "
+                f"directory listing and contact details.")
+
+    caller_org = (caller_identity or {}).get("org_name") or "an anonymous caller"
+    payload = {
+        "from_agent": "Build Guild (ask_build_guild)",
+        "from_firm": (caller_identity or {}).get("org_name") or "Build Guild",
+        "message": question,
+        "metadata": {
+            "via": "ask_build_guild",
+            "caller_identity": caller_identity or {"anonymous": True},
+            "target_org": matched,
+        },
+    }
+    ok, data, err = _bg_relay_agent_message(endpoint, payload)
+    if not ok:
+        return (f"I found {matched}'s {source}, but couldn't get a reply from it "
+                f"({err}). Please try again shortly.")
+
+    reply = data.get("reply") or data.get("message") or ""
+    reply = str(reply).strip()
+    if not reply:
+        reply = "(the agent responded but sent no message text)"
+    return (f"Response from {matched} (forwarded via their {source}, "
+            f"asked on behalf of {caller_org}):\n\n{reply}")
+
+
+def ask_build_guild_tool(question: Any,
+                         caller_identity: Optional[dict] = None) -> dict:
+    """MCP tool: tiered natural-language Q&A over the Build Guild.
+
+    Tier 0 — public marketplace statistics answered directly from Supabase.
+    Tier 1 — questions naming a registered org are forwarded to that org's
+             persistent agent, carrying the caller's identity.
+    Falls back to a helpful capabilities message when neither tier matches.
+    """
+    if not question or not str(question).strip():
+        return _tool_text("Error: 'question' is required.", is_error=True)
+    question = str(question).strip()
+
+    client = get_supabase()
+    if client is None:
+        return _tool_text(
+            "The Build Guild's data store isn't configured right now "
+            "(SUPABASE_URL / SUPABASE_ANON_KEY missing), so I can't answer "
+            "questions yet.",
+            is_error=True,
+        )
+
+    # Tier 1 first: a question that names a specific registered org is more
+    # specific than a generic statistic, and should be routed to that org.
+    try:
+        tier1 = _ask_tier1_answer(client, question, caller_identity)
+    except Exception as exc:
+        _guild_logger.warning("ask_build_guild Tier 1 failed: %s", exc)
+        tier1 = None
+    if tier1 is not None:
+        return _tool_text(tier1, is_error=False)
+
+    # Tier 0: platform-level statistics.
+    try:
+        tier0 = _ask_tier0_answer(client, question)
+    except Exception as exc:
+        _guild_logger.warning("ask_build_guild Tier 0 failed: %s", exc)
+        tier0 = None
+    if tier0 is not None:
+        return _tool_text(tier0, is_error=False)
+
+    # Neither tier matched — explain what this tool can do.
+    return _tool_text(
+        "I couldn't map that to something the Build Guild can answer. I can "
+        "help with:\n"
+        "• Marketplace statistics — e.g. 'how many vendors are in the "
+        "marketplace?', 'how many organizations are registered?', 'how many "
+        "agents are online?'\n"
+        "• Questions about a specific registered organization by name — e.g. "
+        "'who is Independence Waste?' — which I forward to that org's agent if "
+        "they have one registered.\n"
+        "Try naming an organization, or ask for a count of vendors, "
+        "organizations, or agents.",
+        is_error=False,
+    )
 
 
 @app.post("/build-guild/register", status_code=201)
