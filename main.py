@@ -3409,8 +3409,9 @@ async def bg_dashboard(bg_session: Optional[str] = Cookie(default=None),
             '<span style="color:var(--faint)">— share this so teammates can join</span></div>'
         )
     agents_link = (
-        '<div style="margin-top:.9rem">'
+        '<div style="margin-top:.9rem;display:flex;gap:.5rem;flex-wrap:wrap">'
         '<a class="btn sm" href="/build-guild/org/agents">Organization Agents &rarr;</a>'
+        '<a class="btn sm" href="/build-guild/org/mcp-connections">MCP Connections &rarr;</a>'
         "</div>"
     )
     org_banner = (
@@ -4796,6 +4797,376 @@ async def bg_org_agent_deactivate(agent_id: str,
     return RedirectResponse(
         "/build-guild/org/agents?notice=" + quote_plus("Agent deactivated (offline)."),
         status_code=303)
+
+
+# ── Organization MCP connection strings ──────────────────────────────────
+#
+# Each organization can register multiple MCP connection URLs — the URL a user
+# plugs into their LLM connector so it can send queries to Build Guild on
+# behalf of the org (an outbound sender-identity channel, distinct from the
+# inbound persistent-agent registry above). Each connection is named/described
+# (e.g. "Procurement", "Safety", "Project Management"). Any member of the org
+# may manage them; agents acting on behalf of the org consume them at runtime.
+
+_MCP_CONN_COLS = ("id, org_id, name, description, url, created_by, "
+                  "created_at, updated_at")
+
+
+def _bg_org_mcp_connections(client, org_id: str) -> list:
+    """Fetch all MCP connections for an org, newest first."""
+    if client is None or not org_id:
+        return []
+    try:
+        res = (
+            client.table("mcp_connections")
+            .select(_MCP_CONN_COLS)
+            .eq("org_id", org_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception as exc:
+        _guild_logger.warning("Load MCP connections for org %s failed: %s",
+                              org_id, exc)
+        return []
+
+
+def _bg_get_mcp_connection(client, conn_id: str) -> Optional[dict]:
+    if client is None or not conn_id:
+        return None
+    try:
+        res = (
+            client.table("mcp_connections")
+            .select(_MCP_CONN_COLS)
+            .eq("id", conn_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res and res.data else None
+    except Exception:
+        return None
+
+
+def _bg_org_mcp_page(user: dict, org: dict, member_role: str, connections: list,
+                     edit_conn: Optional[dict] = None, notice: str = "") -> str:
+    """Render the org MCP connections management page.
+
+    Any org member may add / edit / delete, so the controls are always shown.
+    ``edit_conn`` pre-opens the edit modal for that connection.
+    """
+    create_btn = (
+        '<button class="btn primary sm" type="button" '
+        "onclick=\"document.getElementById('mcpAddModal').style.display='flex'\">"
+        "+ Add MCP Connection</button>"
+    )
+    add_modal = (
+        '<div id="mcpAddModal" style="display:none;position:fixed;inset:0;z-index:100;'
+        'background:rgba(0,0,0,.7);align-items:center;justify-content:center;padding:1rem">'
+        '<div class="card" style="max-width:460px;width:100%">'
+        "<h2>Add MCP Connection</h2>"
+        '<p class="sub" style="margin-bottom:1rem">Register an MCP connection URL '
+        "your team plugs into an LLM connector to query Build Guild on behalf of "
+        "this organization. Give it a name so callers know what it pertains to "
+        "(e.g. Procurement, Safety, Project Management).</p>"
+        '<form method="post" action="/build-guild/org/mcp-connections/create">'
+        '<label for="mcp_name">Name</label>'
+        '<input id="mcp_name" name="name" type="text" required '
+        'placeholder="e.g. Procurement">'
+        '<label for="mcp_desc">Description <span class="sub">(optional)</span></label>'
+        '<input id="mcp_desc" name="description" type="text" '
+        'placeholder="What this connection is for">'
+        '<label for="mcp_url">Connection URL</label>'
+        '<input id="mcp_url" name="url" type="url" required '
+        'placeholder="https://mcp.zeroeng.io/...">'
+        '<div style="height:1.2rem"></div>'
+        '<div class="row" style="justify-content:flex-end">'
+        '<button class="btn sm" type="button" '
+        "onclick=\"document.getElementById('mcpAddModal').style.display='none'\">"
+        "Cancel</button>"
+        '<button class="btn primary sm" type="submit">Save connection</button>'
+        "</div></form></div></div>"
+    )
+
+    # Per-row edit modals (kept simple, one per connection).
+    edit_modals = []
+    rows = []
+    for c in connections:
+        cid = _bg_esc(c["id"])
+        name = _bg_esc(c.get("name") or "—")
+        desc = _bg_esc(c.get("description") or "")
+        desc_cell = desc or '<span class="sub">—</span>'
+        url_raw = c.get("url") or ""
+        url_val = _bg_esc(url_raw)
+        # JS string-literal safe copy value.
+        url_js = (url_raw.replace("\\", "\\\\").replace("'", "\\'")
+                  .replace("\n", "").replace("\r", ""))
+        modal_id = f"mcpEdit_{cid}"
+        copy_btn = (
+            f'<button class="btn sm" type="button" '
+            f"onclick=\"navigator.clipboard.writeText('{url_js}');"
+            "this.textContent='Copied!';"
+            "setTimeout(function(){this.textContent='Copy';}.bind(this),1500)\">"
+            "Copy</button>"
+        )
+        url_cell = (
+            '<div style="display:flex;gap:.4rem;align-items:center">'
+            f'<a href="{url_val}" target="_blank" rel="noopener" '
+            f'style="word-break:break-all">{url_val}</a>'
+            f"{copy_btn}</div>"
+        )
+        actions = (
+            f'<button class="btn sm" type="button" '
+            f"onclick=\"document.getElementById('{modal_id}').style.display='flex'\">"
+            "Edit</button> "
+            '<form method="post" '
+            f'action="/build-guild/org/mcp-connections/{cid}/delete" '
+            "onsubmit=\"return confirm('Delete this MCP connection? This cannot be undone.')\" "
+            'style="display:inline;margin:0">'
+            '<button class="btn danger sm" type="submit">Delete</button></form>'
+        )
+        created = (c.get("created_at") or "").replace("T", " ")[:16]
+        rows.append(
+            "<tr>"
+            f"<td>{name}</td>"
+            f"<td>{desc_cell}</td>"
+            f"<td>{url_cell}</td>"
+            f'<td>{_bg_esc(created) or "&mdash;"}</td>'
+            f"<td>{actions}</td>"
+            "</tr>"
+        )
+        edit_modals.append(
+            f'<div id="{modal_id}" style="display:none;position:fixed;inset:0;z-index:100;'
+            'background:rgba(0,0,0,.7);align-items:center;justify-content:center;padding:1rem">'
+            '<div class="card" style="max-width:460px;width:100%">'
+            "<h2>Edit MCP Connection</h2>"
+            f'<form method="post" action="/build-guild/org/mcp-connections/{cid}/edit">'
+            '<label>Name</label>'
+            f'<input name="name" type="text" required value="{name}">'
+            '<label>Description <span class="sub">(optional)</span></label>'
+            f'<input name="description" type="text" value="{desc}">'
+            '<label>Connection URL</label>'
+            f'<input name="url" type="url" required value="{url_val}">'
+            '<div style="height:1.2rem"></div>'
+            '<div class="row" style="justify-content:flex-end">'
+            '<button class="btn sm" type="button" '
+            f"onclick=\"document.getElementById('{modal_id}').style.display='none'\">"
+            "Cancel</button>"
+            '<button class="btn primary sm" type="submit">Save changes</button>'
+            "</div></form></div></div>"
+        )
+
+    if rows:
+        table = (
+            "<table><thead><tr><th>Name</th><th>Description</th><th>URL</th>"
+            "<th>Created</th><th>Actions</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>"
+        )
+    else:
+        table = (
+            '<div class="empty">No MCP connections yet.'
+            "<br>Click &ldquo;Add MCP Connection&rdquo; to register your first one."
+            "</div>"
+        )
+
+    # Auto-open an edit modal if requested via ?edit=<id>.
+    autoscript = ""
+    if edit_conn:
+        autoscript = (
+            "<script>document.getElementById('mcpEdit_"
+            f"{_bg_esc(edit_conn['id'])}').style.display='flex';</script>"
+        )
+
+    body = (
+        '<div class="wrap" style="padding-top:1.6rem;padding-bottom:4rem">'
+        '<a class="backlink" href="/build-guild/dashboard">&larr; Back to dashboard</a>'
+        f"{notice}"
+        '<div class="pagehead" style="margin-top:1rem">'
+        f'<div><h1>MCP Connections</h1>'
+        f'<p class="sub" style="margin-bottom:0">Outbound MCP connection URLs for '
+        f'{_bg_esc(org.get("name") or "your organization")} — plug these into an LLM '
+        'connector to query Build Guild on behalf of the org</p></div>'
+        f"{create_btn}"
+        "</div>"
+        f"{table}"
+        f"{add_modal}"
+        f"{''.join(edit_modals)}"
+        f"{autoscript}"
+        "</div>"
+    )
+    return _bg_shell("MCP Connections", body, user)
+
+
+@app.get("/build-guild/org/mcp-connections", response_class=HTMLResponse)
+async def bg_org_mcp_connections(bg_session: Optional[str] = Cookie(default=None),
+                                 edit: Optional[str] = None,
+                                 notice: Optional[str] = None,
+                                 err: Optional[str] = None):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    membership = _bg_get_membership(client, user["id"]) if client else None
+    if not membership:
+        return RedirectResponse("/build-guild/org", status_code=303)
+    org = membership["org"]
+    connections = _bg_org_mcp_connections(client, org["id"])
+    edit_conn = None
+    if edit:
+        edit_conn = next((c for c in connections if str(c.get("id")) == edit), None)
+    banner = ""
+    if notice:
+        banner = f'<div class="msg ok">{_bg_esc(notice)}</div>'
+    elif err:
+        banner = f'<div class="msg err">{_bg_esc(err)}</div>'
+    return HTMLResponse(_bg_org_mcp_page(
+        user, org, membership["member_role"], connections, edit_conn, banner))
+
+
+@app.post("/build-guild/org/mcp-connections/create", response_class=HTMLResponse)
+async def bg_org_mcp_create(request: Request,
+                            bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    from urllib.parse import quote_plus
+    if client is None:
+        return RedirectResponse(
+            "/build-guild/org/mcp-connections?err=Database+not+configured",
+            status_code=303)
+    membership = _bg_get_membership(client, user["id"])
+    if not membership:
+        return RedirectResponse("/build-guild/org", status_code=303)
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    description = (form.get("description") or "").strip()
+    url = (form.get("url") or "").strip()
+    if not name or not url:
+        return RedirectResponse(
+            "/build-guild/org/mcp-connections?err="
+            + quote_plus("Name and connection URL are required."),
+            status_code=303)
+
+    row = {
+        "org_id": membership["org"]["id"],
+        "name": name,
+        "description": description or None,
+        "url": url,
+        "created_by": user["id"],
+    }
+    try:
+        client.table("mcp_connections").insert(row).execute()
+    except Exception as exc:
+        return RedirectResponse(
+            "/build-guild/org/mcp-connections?err="
+            + quote_plus(f"Could not save connection: {exc}"),
+            status_code=303)
+    return RedirectResponse(
+        "/build-guild/org/mcp-connections?notice="
+        + quote_plus(f"MCP connection “{name}” added."),
+        status_code=303)
+
+
+@app.post("/build-guild/org/mcp-connections/{conn_id}/edit",
+          response_class=HTMLResponse)
+async def bg_org_mcp_edit(conn_id: str, request: Request,
+                          bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    from urllib.parse import quote_plus
+    membership = _bg_get_membership(client, user["id"]) if client else None
+    conn = _bg_get_mcp_connection(client, conn_id) if client else None
+    if not membership or not conn or conn.get("org_id") != membership["org"]["id"]:
+        return RedirectResponse(
+            "/build-guild/org/mcp-connections?err=Connection+not+found",
+            status_code=303)
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    description = (form.get("description") or "").strip()
+    url = (form.get("url") or "").strip()
+    if not name or not url:
+        return RedirectResponse(
+            "/build-guild/org/mcp-connections?err="
+            + quote_plus("Name and connection URL are required."),
+            status_code=303)
+
+    update = {"name": name, "description": description or None, "url": url}
+    try:
+        client.table("mcp_connections").update(update).eq("id", conn_id).execute()
+    except Exception as exc:
+        return RedirectResponse(
+            "/build-guild/org/mcp-connections?err="
+            + quote_plus(f"Could not update connection: {exc}"),
+            status_code=303)
+    return RedirectResponse(
+        "/build-guild/org/mcp-connections?notice="
+        + quote_plus(f"MCP connection “{name}” updated."),
+        status_code=303)
+
+
+@app.post("/build-guild/org/mcp-connections/{conn_id}/delete",
+          response_class=HTMLResponse)
+async def bg_org_mcp_delete(conn_id: str,
+                            bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    from urllib.parse import quote_plus
+    membership = _bg_get_membership(client, user["id"]) if client else None
+    conn = _bg_get_mcp_connection(client, conn_id) if client else None
+    if not membership or not conn or conn.get("org_id") != membership["org"]["id"]:
+        return RedirectResponse(
+            "/build-guild/org/mcp-connections?err=Connection+not+found",
+            status_code=303)
+    try:
+        client.table("mcp_connections").delete().eq("id", conn_id).execute()
+    except Exception as exc:
+        return RedirectResponse(
+            "/build-guild/org/mcp-connections?err="
+            + quote_plus(f"Could not delete connection: {exc}"),
+            status_code=303)
+    return RedirectResponse(
+        "/build-guild/org/mcp-connections?notice="
+        + quote_plus("MCP connection deleted."),
+        status_code=303)
+
+
+@app.get("/build-guild/org/{org_id}/mcp-connections.json")
+async def bg_org_mcp_connections_json(org_id: str,
+                                      bg_session: Optional[str] = Cookie(default=None)):
+    """Machine-readable list of an org's MCP connections.
+
+    Consumed by agents acting on behalf of the org (and by org members). Access
+    is limited to authenticated members of the requested organization, mirroring
+    the server-side authorization used throughout the app.
+    """
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    client = get_supabase()
+    membership = _bg_get_membership(client, user["id"]) if client else None
+    if not membership or membership["org"]["id"] != org_id:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    connections = _bg_org_mcp_connections(client, org_id)
+    return JSONResponse({
+        "org_id": org_id,
+        "connections": [
+            {
+                "id": c.get("id"),
+                "name": c.get("name"),
+                "description": c.get("description"),
+                "url": c.get("url"),
+                "created_at": c.get("created_at"),
+                "updated_at": c.get("updated_at"),
+            }
+            for c in connections
+        ],
+    })
 
 
 # ── Project agents: create / ping / deactivate / message thread ──────────
