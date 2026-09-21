@@ -1926,7 +1926,7 @@ def osm_lookup(lat, lon, radius_meters=200, categories=None) -> dict:
     )
 
 
-def _handle_rpc(message: dict) -> Optional[dict]:
+def _handle_rpc(message: dict, server_info: Optional[dict] = None) -> Optional[dict]:
     """Handle a single JSON-RPC message. Returns None for notifications."""
     msg_id = message.get("id")
     method = message.get("method")
@@ -1942,7 +1942,7 @@ def _handle_rpc(message: dict) -> Optional[dict]:
             {
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": SERVER_INFO,
+                "serverInfo": server_info or SERVER_INFO,
             },
         )
 
@@ -1981,8 +1981,15 @@ def _handle_rpc(message: dict) -> Optional[dict]:
     return _rpc_error(msg_id, -32601, f"Method not found: {method}")
 
 
-@app.post("/mcp")
-async def mcp_endpoint(request: Request):
+async def _process_mcp_request(request: Request,
+                               server_info: Optional[dict] = None) -> JSONResponse:
+    """Parse a JSON-RPC request body and dispatch it (single or batch).
+
+    Shared by the public ``/mcp`` endpoint and the per-connection
+    ``/build-guild/mcp/{token}`` endpoint so both speak the same
+    Streamable-HTTP JSON-RPC 2.0 transport that MCP clients (Claude, Cursor,
+    Abacus, etc.) expect.
+    """
     try:
         payload = await request.json()
     except Exception:
@@ -1992,7 +1999,8 @@ async def mcp_endpoint(request: Request):
 
     # Support both a single message and a batch.
     if isinstance(payload, list):
-        responses = [r for r in (_handle_rpc(m) for m in payload) if r is not None]
+        responses = [r for r in (_handle_rpc(m, server_info) for m in payload)
+                     if r is not None]
         if not responses:
             return JSONResponse(content=None, status_code=202)
         return JSONResponse(content=responses)
@@ -2002,11 +2010,16 @@ async def mcp_endpoint(request: Request):
             _rpc_error(None, -32600, "Invalid Request"), status_code=400
         )
 
-    response = _handle_rpc(payload)
+    response = _handle_rpc(payload, server_info)
     if response is None:
         # Notification -- acknowledge with no body.
         return JSONResponse(content=None, status_code=202)
     return JSONResponse(content=response)
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request):
+    return await _process_mcp_request(request)
 
 
 
@@ -5172,18 +5185,15 @@ async def bg_org_mcp_connections_json(org_id: str,
     })
 
 
-@app.get("/build-guild/mcp/{token}")
-async def bg_mcp_resolve(token: str):
-    """Resolve a minted MCP connection URL to the org identity it represents.
+def _bg_resolve_mcp_token(token: str):
+    """Look up an MCP connection (and its org) by token.
 
-    This is the public endpoint that each generated connection URL points at.
-    An LLM connector hits it to discover which organization (and which named
-    connection) the caller is acting on behalf of. Returns a compact identity
-    document, or 404 if the token is unknown.
+    Returns (conn, org) where either may be None. ``conn`` is None when the
+    token is unknown or the database is unavailable.
     """
     client = get_supabase()
     if client is None:
-        return JSONResponse({"ok": False, "error": "unavailable"}, status_code=503)
+        return None, None
     conn = None
     try:
         res = (
@@ -5196,9 +5206,9 @@ async def bg_mcp_resolve(token: str):
         conn = res.data[0] if res and res.data else None
     except Exception as exc:
         _guild_logger.warning("MCP token resolve failed: %s", exc)
-        return JSONResponse({"ok": False, "error": "error"}, status_code=500)
+        return None, None
     if not conn:
-        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+        return None, None
     org = None
     try:
         ores = (
@@ -5211,6 +5221,42 @@ async def bg_mcp_resolve(token: str):
         org = ores.data[0] if ores and ores.data else None
     except Exception:
         org = None
+    return conn, org
+
+
+@app.get("/build-guild/mcp/{token}")
+async def bg_mcp_resolve(token: str, request: Request):
+    """Per-connection MCP endpoint (GET side).
+
+    MCP clients using the Streamable-HTTP transport POST their JSON-RPC
+    messages here (see ``bg_mcp_rpc`` below). A GET is only used to (a) probe
+    for a server-initiated SSE stream, or (b) fetch a human/agent-readable
+    identity document.
+
+    This server does not offer a server-initiated SSE stream, so an SSE probe
+    (``Accept: text/event-stream``) gets a 405 with ``Allow: POST`` — the
+    signal the MCP spec defines for "use the POST endpoint instead". Any other
+    GET returns the compact identity document describing which organization and
+    named connection the token represents (404 if the token is unknown).
+    """
+    accept = (request.headers.get("accept") or "").lower()
+    if "text/event-stream" in accept:
+        # We don't support a standalone SSE stream; tell the client to POST.
+        return JSONResponse(
+            _rpc_error(None, -32000,
+                       "This MCP server uses Streamable HTTP. Send JSON-RPC "
+                       "requests via POST to this same URL."),
+            status_code=405,
+            headers={"Allow": "POST, OPTIONS"},
+        )
+
+    conn, org = _bg_resolve_mcp_token(token)
+    if conn is None:
+        client = get_supabase()
+        if client is None:
+            return JSONResponse({"ok": False, "error": "unavailable"},
+                                status_code=503)
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
     return JSONResponse({
         "ok": True,
         "org_id": conn.get("org_id"),
@@ -5219,6 +5265,41 @@ async def bg_mcp_resolve(token: str):
         "connection_name": conn.get("name"),
         "connection_description": conn.get("description"),
     })
+
+
+@app.post("/build-guild/mcp/{token}")
+async def bg_mcp_rpc(token: str, request: Request):
+    """Per-connection MCP endpoint (Streamable-HTTP JSON-RPC 2.0).
+
+    This is what MCP clients (Claude custom connectors, Cursor, Abacus, etc.)
+    actually talk to. It validates the connection token, then dispatches the
+    JSON-RPC message(s) through the same handler that powers the public
+    ``/mcp`` endpoint. The ``serverInfo`` returned by ``initialize`` is
+    labelled with the connection's name so the operator can tell which
+    connection they're bound to.
+
+    Previously only a GET handler existed on this path, so the POST that every
+    MCP client sends returned HTTP 405 Method Not Allowed — which is why the
+    connector could not be added.
+    """
+    conn, org = _bg_resolve_mcp_token(token)
+    if conn is None:
+        client = get_supabase()
+        if client is None:
+            return JSONResponse(
+                _rpc_error(None, -32000, "Server database unavailable"),
+                status_code=503)
+        return JSONResponse(
+            _rpc_error(None, -32001, "Unknown MCP connection token"),
+            status_code=404)
+
+    conn_name = conn.get("name") or "connection"
+    org_name = (org or {}).get("name") or "org"
+    server_info = {
+        "name": f"zeroeng-mcp ({org_name}: {conn_name})",
+        "version": SERVER_INFO.get("version", "1.0.0"),
+    }
+    return await _process_mcp_request(request, server_info=server_info)
 
 
 # ── Project agents: create / ping / deactivate / message thread ──────────
