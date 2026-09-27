@@ -4692,6 +4692,15 @@ def _bg_org_agents_page(user: dict, org: dict, member_role: str, agents: list,
                 'style="display:inline;margin:0">'
                 '<button class="btn danger sm" type="submit">Deactivate</button></form>'
             )
+        if is_admin:
+            actions += (
+                ' <form method="post" '
+                f'action="/build-guild/org/agents/{_bg_esc(a["id"])}/delete" '
+                "onsubmit=\"return confirm('Are you sure you want to delete this agent? "
+                "This action cannot be undone.')\" "
+                'style="display:inline;margin:0">'
+                '<button class="btn danger sm" type="submit">Delete</button></form>'
+            )
         last_ping_cell = _bg_esc(last_ping) or '<span class="sub">never</span>'
         caps_cell = _bg_esc(caps) or '<span class="sub">—</span>'
         agent_url_val = _bg_esc(a.get("agent_url") or "")
@@ -4860,6 +4869,39 @@ async def bg_org_agent_deactivate(agent_id: str,
             status_code=303)
     return RedirectResponse(
         "/build-guild/org/agents?notice=" + quote_plus("Agent deactivated (offline)."),
+        status_code=303)
+
+
+@app.post("/build-guild/org/agents/{agent_id}/delete")
+async def bg_org_agent_delete(agent_id: str,
+                              bg_session: Optional[str] = Cookie(default=None)):
+    user = _bg_get_current_user(bg_session)
+    if not user:
+        return RedirectResponse("/build-guild/login", status_code=303)
+    client = get_supabase()
+    from urllib.parse import quote_plus
+    membership = _bg_get_membership(client, user["id"]) if client else None
+    agent = _bg_get_agent(client, agent_id) if client else None
+    # Cross-tenant protection: the agent must belong to the caller's org.
+    if not membership or not agent or agent.get("org_id") != membership["org"]["id"]:
+        return RedirectResponse("/build-guild/org/agents?err=Agent+not+found",
+                                status_code=303)
+    if (membership["member_role"] or "").lower() != "admin":
+        return RedirectResponse(
+            "/build-guild/org/agents?err=" + quote_plus(
+                "Only an organization admin can delete company agents."),
+            status_code=303)
+    agent_name = agent.get("name") or "Agent"
+    try:
+        # Hard delete. ON DELETE CASCADE removes related agent_messages rows.
+        client.table("agents").delete().eq("id", agent_id).execute()
+    except Exception as exc:
+        return RedirectResponse(
+            "/build-guild/org/agents?err=" + quote_plus(f"Could not delete: {exc}"),
+            status_code=303)
+    return RedirectResponse(
+        "/build-guild/org/agents?notice=" + quote_plus(
+            f"Agent “{agent_name}” deleted."),
         status_code=303)
 
 
